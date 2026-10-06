@@ -25,6 +25,24 @@ namespace graphics::internal {
 
 namespace {
 
+const char* vkResultName(VkResult result) {
+	switch (result) {
+	case VK_SUCCESS: return "VK_SUCCESS";
+	case VK_NOT_READY: return "VK_NOT_READY";
+	case VK_TIMEOUT: return "VK_TIMEOUT";
+	case VK_EVENT_SET: return "VK_EVENT_SET";
+	case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+	case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+	case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+	case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+	case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+	case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+	default: return "VK_UNKNOWN_ERROR";
+	}
+}
+
+bool vk_frame_valid = false;
+
 VkInstance vk_instance;
 uint32_t vk_api_version;
 VkSurfaceKHR vk_surface;
@@ -723,26 +741,32 @@ FrameData prepare() {
 	vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight, VK_TRUE, UINT64_MAX);
 
 retry_acquire:
-	switch (vkAcquireNextImageKHR(context.device, vk_swapchain, UINT64_MAX,
-								  vk_semaphore_image_available, VK_NULL_HANDLE,
-								  &vk_swapchain_current_image)) {
+	const VkResult acquire_result = vkAcquireNextImageKHR(
+		context.device, vk_swapchain, UINT64_MAX,
+		vk_semaphore_image_available, VK_NULL_HANDLE, &vk_swapchain_current_image);
+
+	switch (acquire_result) {
 	case VK_SUCCESS:
+		break;
+
+	case VK_SUBOPTIMAL_KHR:
+		std::cerr << "Swapchain is suboptimal for rendering!\n";
 		break;
 
 	case VK_ERROR_OUT_OF_DATE_KHR:
 		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
 		goto retry_acquire;
 
-	case VK_SUBOPTIMAL_KHR:
-		std::cerr << "Swapchain is suboptimal for rendering!\n";
-		break;
-
 	default:
-		std::cerr << "Failed to present Vulkan swapchain image\n";
+		std::cerr << "vkAcquireNextImageKHR failed: "
+				  << vkResultName(acquire_result) << '\n';
+		vk_frame_valid = false;
 		return {};
 	}
 
 	vkResetFences(context.device, 1, &vk_fence_frame_in_flight);
+
+	vk_frame_valid = true;
 
 	return {
 		.framebuffer = vk_framebuffers[vk_swapchain_current_image],
@@ -751,6 +775,11 @@ retry_acquire:
 }
 
 void submitAndPresent() {
+	if (!vk_frame_valid) {
+		std::cerr << "Skipping frame submit: swapchain image was not acquired\n";
+		return;
+	}
+
 	drawImGUI();
 
 	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -782,12 +811,19 @@ void submitAndPresent() {
 	};
 
 	VkResult result = vkQueuePresentKHR(context.graphics_queue, &present);
+	if (result == VK_SUCCESS || result == VK_NOT_READY) {
+		vk_frame_valid = false;
+		return;
+	}
+
 	if (result == VK_ERROR_OUT_OF_DATE_KHR ||
 	    result == VK_SUBOPTIMAL_KHR ||
 	    vk_swapchain_resize_require) {
+		vk_frame_valid = false;
 		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
 	} else {
-		std::cerr << "Failed to present Vulkan swapchain image\n";
+		std::cerr << "vkQueuePresentKHR failed: " << vkResultName(result) << '\n';
+		vk_frame_valid = false;
 	}
 }
 
