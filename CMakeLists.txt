@@ -93,7 +93,7 @@ if(GLSLC_FOUND)
 		add_custom_command(
 			OUTPUT ${SHADER_BINARY_PATH}
 			COMMAND glslc ${SHADER_SOURCE} -o ${SHADER_BINARY_PATH}
-			DEPENDS ${SHADER_SOURCE}
+			DEPENDS ${SHADER_SOURCE} ${CMAKE_SOURCE_DIR}/shaders/scene.glsl
 			COMMENT "Compiling ${SHADER_FILE} shader"
 		)
 
