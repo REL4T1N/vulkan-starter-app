@@ -1,394 +1,190 @@
 #include "application.hpp"
+#include "scene.hpp"
 
-#include <array>
-#include <cmath>
-#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <vector>
-
 #include <imgui.h>
 
 namespace application {
-
 namespace {
+using namespace scene;
 
-constexpr float kPi = 3.14159265358979323846f;
-
-// Матрицы хранятся в column-major порядке: m[column * 4 + row],
-struct Vec3 {
-	float x, y, z;
+struct Buffer {
+    VkBuffer handle = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize size = 0;
 };
-
-struct Mat4 {
-	// Column-major storage: m[column * 4 + row]
-	float m[16];
-};
-
-Mat4 matIdentity() {
-	return { .m = {
-		1.f, 0.f, 0.f, 0.f,
-		0.f, 1.f, 0.f, 0.f,
-		0.f, 0.f, 1.f, 0.f,
-		0.f, 0.f, 0.f, 1.f,
-	}};
-}
-
-// Умножение матриц: r = a * b (применение: сначала b, потом a)
-Mat4 matMultiply(const Mat4& a, const Mat4& b) {
-	Mat4 r{};
-	for (int c = 0; c < 4; ++c) {
-		for (int row = 0; row < 4; ++row) {
-			float s = 0.f;
-			for (int k = 0; k < 4; ++k) {
-				s += a.m[k * 4 + row] * b.m[c * 4 + k];
-			}
-			r.m[c * 4 + row] = s;
-		}
-	}
-	return r;
-}
-
-Mat4 matTranslate(float x, float y, float z) {
-	Mat4 r = matIdentity();
-	r.m[12] = x;
-	r.m[13] = y;
-	r.m[14] = z;
-	return r;
-}
-
-Mat4 matScale(float x, float y, float z) {
-	Mat4 r = matIdentity();
-	r.m[0] = x;
-	r.m[5] = y;
-	r.m[10] = z;
-	return r;
-}
-
-Mat4 matRotateX(float degrees) {
-	const float a = degrees * kPi / 180.f;
-	const float c = std::cos(a), s = std::sin(a);
-	return { .m = {
-		1.f, 0.f, 0.f, 0.f,
-		0.f, c, s, 0.f,
-		0.f, -s, c, 0.f,
-		0.f, 0.f, 0.f, 1.f,
-	}};
-}
-
-Mat4 matRotateY(float degrees) {
-	const float a = degrees * kPi / 180.f;
-	const float c = std::cos(a), s = std::sin(a);
-	return { .m = {
-		c, 0.f, -s, 0.f,
-		0.f, 1.f, 0.f, 0.f,
-		s, 0.f, c, 0.f,
-		0.f, 0.f, 0.f, 1.f,
-	}};
-}
-
-Mat4 matRotateZ(float degrees) {
-	const float a = degrees * kPi / 180.f;
-	const float c = std::cos(a), s = std::sin(a);
-	return { .m = {
-		c, s, 0.f, 0.f,
-		-s, c, 0.f, 0.f,
-		0.f, 0.f, 1.f, 0.f,
-		0.f, 0.f, 0.f, 1.f,
-	}};
-}
-
-// Перспективная проекция
-Mat4 matPerspective(float fovYDegrees, float aspect, float zNear, float zFar) {
-	const float f = 1.f / std::tan(fovYDegrees * kPi / 360.f);
-	Mat4 r{};
-	r.m[0] = f / aspect;
-	r.m[5] = f;
-	r.m[10] = (zFar + zNear) / (zNear - zFar);
-	r.m[11] = -1.f;
-	r.m[14] = 2.f * zFar * zNear / (zNear - zFar);
-	return r;
-}
-
-// Ортографическая проекция: параллельные лучи, без схлопывания к горизонту
-Mat4 matOrtho(float left, float right, float bottom, float top, float zNear, float zFar) {
-	Mat4 r = matIdentity();
-	r.m[0] = 2.f / (right - left);
-	r.m[5] = 2.f / (top - bottom);
-	r.m[10] = -2.f / (zFar - zNear);
-	r.m[12] = -(right + left) / (right - left);
-	r.m[13] = -(top + bottom) / (top - bottom);
-	r.m[14] = -(zFar + zNear) / (zFar - zNear);
-	return r;
-}
-
-// Матрица камеры: взгляд из точки eye в точку center
-Mat4 matLookAt(Vec3 eye, Vec3 center, Vec3 up) {
-	const auto sub = [](Vec3 a, Vec3 b) { return Vec3{ a.x - b.x, a.y - b.y, a.z - b.z }; };
-	const auto cross = [](Vec3 a, Vec3 b) {
-		return Vec3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
-	};
-	const auto dot = [](Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
-	const auto norm = [dot](Vec3 a) {
-		const float l = std::sqrt(dot(a, a));
-		return Vec3{ a.x / l, a.y / l, a.z / l };
-	};
-
-	const Vec3 f = norm(sub(center, eye)); // направление взгляда
-	const Vec3 s = norm(cross(f, up));     // "право" камеры
-	const Vec3 u = cross(s, f);            // "верх" камеры
-
-	return { .m = {
-		s.x, u.x, -f.x, 0.f,
-		s.y, u.y, -f.y, 0.f,
-		s.z, u.z, -f.z, 0.f,
-		-dot(s, eye), -dot(u, eye), dot(f, eye), 1.f,
-	}};
-}
-
-// Конверсия OpenGL-проекции в clip space Vulkan:
-//   1) инверсия Y (ось Y направлена вниз);
-//   2) сжатие глубины из [-1, 1] в [0, 1] (z' = 0.5*z + 0.5*w).
-Mat4 matVulkanClipCorrection() {
-	return { .m = {
-		1.f, 0.f, 0.f, 0.f,
-		0.f, -1.f, 0.f, 0.f,
-		0.f, 0.f, 0.5f, 0.f,
-		0.f, 0.f, 0.5f, 1.f,
-	}};
-}
-
-struct Vertex {
-	Vec3 position;
-	Vec3 color;
-};
-
-const Vec3 kTruncatedTetrahedronPositions[12] = {
-	{ 3.f, 1.f, 1.f },   // 0  P(A,B)
-	{ 1.f, 3.f, 1.f },   // 1  P(A,C)
-	{ 1.f, 1.f, 3.f },   // 2  P(A,D)
-	{ 3.f, -1.f, -1.f }, // 3  P(B,A)
-	{ 1.f, -1.f, -3.f }, // 4  P(B,C)
-	{ 1.f, -3.f, -1.f }, // 5  P(B,D)
-	{ -1.f, 3.f, -1.f }, // 6  P(C,A)
-	{ -1.f, 1.f, -3.f }, // 7  P(C,B)
-	{ -3.f, 1.f, -1.f }, // 8  P(C,D)
-	{ -1.f, -1.f, 3.f }, // 9  P(D,A)
-	{ -1.f, -3.f, 1.f }, // 10 P(D,B)
-	{ -3.f, -1.f, 1.f }, // 11 P(D,C)
-};
-
-// Индексы: треугольные грани + шестиугольники как веера треугольников.
-// Обход против часовой стрелки при взгляде снаружи.
-const uint16_t kTruncatedTetrahedronIndices[60] = {
-	// треугольные грани (срезы вершин тетраэдра)
-	0, 1, 2,
-	3, 5, 4,
-	6, 7, 8,
-	9, 10, 11,
-	// шестиугольник ABC
-	0, 3, 4,
-	0, 4, 7,
-	0, 7, 6,
-	0, 6, 1,
-	// шестиугольник ABD
-	0, 2, 9,
-	0, 9, 10,
-	0, 10, 5,
-	0, 5, 3,
-	// шестиугольник ACD
-	1, 6, 8,
-	1, 8, 11,
-	1, 11, 9,
-	1, 9, 2,
-	// шестиугольник BCD
-	4, 5, 10,
-	4, 10, 11,
-	4, 11, 8,
-	4, 8, 7,
-};
-
-constexpr uint32_t kTruncatedTetrahedronIndexCount =
-	sizeof(kTruncatedTetrahedronIndices) / sizeof(kTruncatedTetrahedronIndices[0]);
-
-struct UniformBlock {
-	float mvp[16];
-	float color[4];
-};
-
-// Ресурсы одного объекта: геометрия + uniform-буфер + дескриптор
 struct ObjectResources {
-	VkBuffer vertex_buffer = VK_NULL_HANDLE;
-	VmaAllocation vertex_allocation = VK_NULL_HANDLE;
-
-	VkBuffer index_buffer = VK_NULL_HANDLE;
-	VmaAllocation index_allocation = VK_NULL_HANDLE;
-
-	VkBuffer uniform_buffer = VK_NULL_HANDLE;
-	VmaAllocation uniform_allocation = VK_NULL_HANDLE;
-	void* uniform_mapped = nullptr;
-
-	VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-
-	uint32_t index_count = 0;
+    Buffer vertices, indices, uniform;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    uint32_t index_count = 0;
+};
+struct ModelControls {
+    float position[3];
+    float rotation[3];
+    float scale[3];
+    float albedo[3];
+    float specular[3] = {0.8f, 0.8f, 0.8f};
+    float shininess = 32.f;
+    bool vertex_colors = false;
+};
+struct SpotControls {
+    PointLight light = {{0.f, 5.f, 5.f, 0.f}, {1.f, 0.85f, 0.6f, 35.f}};
+    float pitch = -45.f, yaw = 0.f;
+    float inner = 18.f, outer = 30.f;
 };
 
 VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 VkPipeline pipeline = VK_NULL_HANDLE;
-VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout scene_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout model_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+VkDescriptorSet scene_set = VK_NULL_HANDLE;
+Buffer scene_buffer, point_buffer, spot_buffer;
 ObjectResources objects[2];
+VkDeviceSize max_storage_range = 0;
+const char* resource_error = nullptr;
 
+ModelControls models[2] = {
+    {{-2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.65f, 0.65f, 0.65f}, {0.25f, 0.55f, 0.85f}},
+    {{ 2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}, {0.85f, 0.4f, 0.15f}},
+};
+float camera_position[3] = {0.f, 4.f, 13.f};
+float camera_angles[3] = {-17.f, 0.f, 0.f}; // pitch, yaw, roll in degrees
+float camera_fov = 50.f;
+float ortho_size = 6.f;
+int projection_index = 0;
+float ambient_color[3] = {1.f, 1.f, 1.f};
+float ambient_intensity = 0.08f;
+float directional_angles[2] = {-45.f, 30.f};
+float directional_color[3] = {1.f, 1.f, 1.f};
+float directional_intensity = 0.7f;
+std::vector<PointLight> point_lights = {{{-3.f, 3.f, 4.f, 0.f}, {0.6f, 0.8f, 1.f, 20.f}}};
+std::vector<SpotControls> spot_lights = {SpotControls{}};
+std::vector<SpotLight> packed_spots;
 
-int projection_index = 0; 
-
-float figure_position[3] = { 0.f, 0.f, 0.f };
-float figure_rotation[3] = { 0.f, 0.f, 0.f }; // градусы
-float figure_scale[3] = { 1.f, 1.f, 1.f };
-float figure_color[3] = { 1.f, 1.f, 1.f };
-
-bool animation_enabled = true;
+bool animation_enabled = false;
 float animation_speed = 1.f;
-float trajectory_radius = 2.f;
+float trajectory_radius = 0.75f;
 double animation_time = 0.0;
 double last_frame_time = 0.0;
 
-float second_position[3] = { 0.f, 0.f, 0.f };
-float second_rotation[3] = { 0.f, 0.f, 0.f };
-float second_scale[3] = { 0.5f, 0.5f, 0.5f };
-float second_color[3] = { 1.f, 0.55f, 0.15f };
-
-bool loadShader(const char* path, std::vector<char>& out) {
-	std::ifstream file(path, std::ios::ate | std::ios::binary);
-	if (!file.is_open()) {
-		std::cerr << "Failed to open shader file: " << path << '\n';
-		return false;
-	}
-
-	const size_t size = size_t(file.tellg());
-	out.resize(size);
-	file.seekg(0);
-	file.read(out.data(), std::streamsize(size));
-
-	return true;
+bool loadShader(const char* path, std::vector<uint32_t>& out) {
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (!file || file.tellg() <= 0 || file.tellg() % 4 != 0) {
+        std::cerr << "Cannot read SPIR-V shader: " << path << '\n';
+        return false;
+    }
+    const size_t size = static_cast<size_t>(file.tellg());
+    out.resize(size / sizeof(uint32_t));
+    file.seekg(0);
+    return bool(file.read(reinterpret_cast<char*>(out.data()), std::streamsize(size)));
 }
 
-bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer* buffer,
-				  VmaAllocation* allocation, void** mapped) {
-	auto& ctx = graphics::internal::context;
-
-	const VkBufferCreateInfo buffer_info = {
-		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size = size,
-		.usage = usage,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	};
-
-	VmaAllocationInfo allocation_info{};
-
-	const VmaAllocationCreateInfo allocation_create = {
-		.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-				 VMA_ALLOCATION_CREATE_MAPPED_BIT,
-		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-	};
-
-	if (vmaCreateBuffer(ctx.allocator, &buffer_info, &allocation_create,
-						buffer, allocation, &allocation_info) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate Vulkan buffer\n";
-		return false;
-	}
-
-	*mapped = allocation_info.pMappedData;
-	return true;
+void destroyBuffer(Buffer& buffer) {
+    if (buffer.handle != VK_NULL_HANDLE)
+        vmaDestroyBuffer(graphics::internal::context.allocator, buffer.handle, buffer.allocation);
+    buffer = {};
 }
 
-bool createObjectResources(uint32_t object_index, const Vertex* vertices,
-						   uint32_t vertex_count, const uint16_t* indices,
-						   uint32_t index_count) {
-	auto& ctx = graphics::internal::context;
-	ObjectResources& object = objects[object_index];
+bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage) {
+    const VkBufferCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    const VmaAllocationCreateInfo allocation = {
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VmaAllocationInfo mapped{};
+    if (vmaCreateBuffer(graphics::internal::context.allocator, &info, &allocation,
+                       &buffer.handle, &buffer.allocation, &mapped) != VK_SUCCESS) {
+        resource_error = "Could not allocate a GPU buffer.";
+        std::cerr << resource_error << '\n';
+        return false;
+    }
+    buffer.mapped = mapped.pMappedData;
+    buffer.size = size;
+    return true;
+}
 
-	object.index_count = index_count;
+void upload(const Buffer& buffer, const void* data, size_t size) {
+    if (size == 0) return;
+    std::memcpy(buffer.mapped, data, size);
+    if (vmaFlushAllocation(graphics::internal::context.allocator, buffer.allocation, 0, size) != VK_SUCCESS) {
+        resource_error = "Could not flush GPU buffer memory.";
+        std::cerr << resource_error << '\n';
+    }
+}
 
-	void* mapped = nullptr;
+void bindBuffer(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const Buffer& buffer) {
+    const VkDescriptorBufferInfo info = {.buffer = buffer.handle, .offset = 0, .range = buffer.size};
+    const VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set,
+        .dstBinding = binding,
+        .descriptorCount = 1,
+        .descriptorType = type,
+        .pBufferInfo = &info,
+    };
+    vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
 
-	if (!createBuffer(sizeof(Vertex) * vertex_count,
-					  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-					  &object.vertex_buffer, &object.vertex_allocation, &mapped)) {
-		return false;
-	}
-	std::memcpy(mapped, vertices, sizeof(Vertex) * vertex_count);
+bool ensureStorage(Buffer& buffer, size_t count, size_t stride, uint32_t binding) {
+    const VkDeviceSize required = std::max(size_t(1), count) * stride;
+    if (required <= buffer.size) return true;
+    if (required > max_storage_range) {
+        resource_error = "The light array exceeds this GPU's storage buffer range.";
+        return false;
+    }
+    Buffer replacement;
+    const VkDeviceSize size = std::min(max_storage_range, std::max(required, buffer.size * 2));
+    if (!createBuffer(replacement, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return false;
+    bindBuffer(scene_set, binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, replacement);
+    destroyBuffer(buffer);
+    buffer = replacement;
+    return true;
+}
 
-	if (!createBuffer(sizeof(uint16_t) * index_count,
-					  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-					  &object.index_buffer, &object.index_allocation, &mapped)) {
-		return false;
-	}
-	std::memcpy(mapped, indices, sizeof(uint16_t) * index_count);
-
-	if (!createBuffer(sizeof(UniformBlock), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-					  &object.uniform_buffer, &object.uniform_allocation,
-					  &object.uniform_mapped)) {
-		return false;
-	}
-
-	const VkDescriptorBufferInfo buffer_info = {
-		.buffer = object.uniform_buffer,
-		.offset = 0,
-		.range = sizeof(UniformBlock),
-	};
-
-	const VkWriteDescriptorSet write = {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.dstSet = object.descriptor_set,
-		.dstBinding = 0,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.pBufferInfo = &buffer_info,
-	};
-
-	vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
-
-	return true;
+bool createObjectResources(ObjectResources& object, const Mesh& mesh) {
+    object.index_count = static_cast<uint32_t>(mesh.indices.size());
+    if (!createBuffer(object.vertices, mesh.vertices.size()*sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
+        !createBuffer(object.indices, mesh.indices.size()*sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT) ||
+        !createBuffer(object.uniform, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
+    upload(object.vertices, mesh.vertices.data(), mesh.vertices.size()*sizeof(Vertex));
+    upload(object.indices, mesh.indices.data(), mesh.indices.size()*sizeof(uint16_t));
+    bindBuffer(object.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, object.uniform);
+    return true;
 }
 
 bool initializeGraphicsPipeline() {
-	auto& ctx = graphics::internal::context;
-
-	const VkDescriptorSetLayoutBinding layout_binding = {
-		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-	};
-
-	const VkDescriptorSetLayoutCreateInfo layout_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1,
-		.pBindings = &layout_binding,
-	};
-
-	if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr,
-									&descriptor_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create Vulkan descriptor set layout\n";
-		return false;
-	}
-
-	const VkPipelineLayoutCreateInfo pipeline_layout_info = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
-	};
-
-	if (vkCreatePipelineLayout(ctx.device, &pipeline_layout_info, nullptr,
-							   &pipeline_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create Vulkan pipeline layout\n";
-		return false;
-	}
-
-	std::vector<char> vert_code;
-	std::vector<char> frag_code;
+    auto& ctx = graphics::internal::context;
+    const VkDescriptorSetLayoutBinding scene_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = scene_bindings,
+    };
+    if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &scene_layout) != VK_SUCCESS) return false;
+    layout_info.bindingCount = 1;
+    if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &model_layout) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
+    const VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 2,
+        .pSetLayouts = layouts,
+    };
+    if (vkCreatePipelineLayout(ctx.device, &pipeline_layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) return false;
+	std::vector<uint32_t> vert_code;
+	std::vector<uint32_t> frag_code;
 
 	if (!loadShader("shaders/triangle.vert.spv", vert_code) ||
 	    !loadShader("shaders/triangle.frag.spv", frag_code)) {
@@ -399,7 +195,7 @@ bool initializeGraphicsPipeline() {
 		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 	};
 
-	module_info.codeSize = vert_code.size();
+	module_info.codeSize = vert_code.size() * sizeof(uint32_t);
 	module_info.pCode = reinterpret_cast<const uint32_t*>(vert_code.data());
 
 	VkShaderModule vertex_module;
@@ -408,7 +204,7 @@ bool initializeGraphicsPipeline() {
 		return false;
 	}
 
-	module_info.codeSize = frag_code.size();
+	module_info.codeSize = frag_code.size() * sizeof(uint32_t);
 	module_info.pCode = reinterpret_cast<const uint32_t*>(frag_code.data());
 
 	VkShaderModule fragment_module;
@@ -452,13 +248,19 @@ bool initializeGraphicsPipeline() {
 			.format = VK_FORMAT_R32G32B32_SFLOAT,
 			.offset = offsetof(Vertex, color),
 		},
+		{
+			.location = 2,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(Vertex, normal),
+		},
 	};
 
 	const VkPipelineVertexInputStateCreateInfo vertex_input = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount = 1,
 		.pVertexBindingDescriptions = &vertex_binding,
-		.vertexAttributeDescriptionCount = 2,
+		.vertexAttributeDescriptionCount = 3,
 		.pVertexAttributeDescriptions = vertex_attributes,
 	};
 
@@ -550,215 +352,230 @@ bool initializeGraphicsPipeline() {
 }
 
 bool initializeObjects() {
-	auto& ctx = graphics::internal::context;
+    auto& ctx = graphics::internal::context;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(ctx.physical_device, &properties);
+    max_storage_range = properties.limits.maxStorageBufferRange;
+    const VkDescriptorPoolSize sizes[] = {
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+    };
+    const VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 3,
+        .poolSizeCount = 2,
+        .pPoolSizes = sizes,
+    };
+    if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout, model_layout};
+    const VkDescriptorSetAllocateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = 3,
+        .pSetLayouts = layouts,
+    };
+    VkDescriptorSet sets[3]{};
+    if (vkAllocateDescriptorSets(ctx.device, &info, sets) != VK_SUCCESS) return false;
+    scene_set = sets[0];
+    objects[0].descriptor_set = sets[1];
+    objects[1].descriptor_set = sets[2];
+    if (!createBuffer(scene_buffer, sizeof(SceneUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
+    bindBuffer(scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_buffer);
+    if (!ensureStorage(point_buffer, point_lights.size(), sizeof(PointLight), 1) ||
+        !ensureStorage(spot_buffer, spot_lights.size(), sizeof(SpotLight), 2)) return false;
+    const Mesh mesh = makeTruncatedTetrahedron();
+    for (auto& object : objects) {
+        if (!createObjectResources(object, mesh)) return false;
+    }
+    return true;
+}
 
-	std::array<Vertex, 12> vertices{};
-	for (uint32_t i = 0; i < 12; ++i) {
-		const Vec3& p = kTruncatedTetrahedronPositions[i];
-		vertices[i].position = p;
-		vertices[i].color = {
-			0.5f + p.x / 6.f,
-			0.5f + p.y / 6.f,
-			0.5f + p.z / 6.f,
-		};
-	}
+void editLight(PointLight& light) {
+    ImGui::DragFloat3("Position", &light.position.x, 0.05f);
+    ImGui::ColorEdit3("Color", &light.color.x);
+    ImGui::DragFloat("Intensity", &light.color.w, 0.1f, 0.f, 1000.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+}
 
-	const VkDescriptorPoolSize pool_size = {
-		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 2,
-	};
-
-	const VkDescriptorPoolCreateInfo pool_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 2,
-		.poolSizeCount = 1,
-		.pPoolSizes = &pool_size,
-	};
-
-	if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr,
-							   &descriptor_pool) != VK_SUCCESS) {
-		std::cerr << "Failed to create Vulkan descriptor pool\n";
-		return false;
-	}
-
-	const VkDescriptorSetAllocateInfo set_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.descriptorPool = descriptor_pool,
-		.descriptorSetCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
-	};
-
-	for (uint32_t i = 0; i < 2; ++i) {
-		if (vkAllocateDescriptorSets(ctx.device, &set_info,
-									 &objects[i].descriptor_set) != VK_SUCCESS) {
-			std::cerr << "Failed to allocate Vulkan descriptor set #" << i << '\n';
-			return false;
-		}
-	}
-
-	if (!createObjectResources(0, vertices.data(), 12,
-							   kTruncatedTetrahedronIndices, kTruncatedTetrahedronIndexCount)) {
-		return false;
-	}
-
-	if (!createObjectResources(1, vertices.data(), 12,
-							   kTruncatedTetrahedronIndices, kTruncatedTetrahedronIndexCount)) {
-		return false;
-	}
-
-	return true;
+void editModel(ModelControls& model) {
+    ImGui::DragFloat3("Position", model.position, 0.05f);
+    ImGui::DragFloat3("Rotation (deg)", model.rotation, 1.f);
+    ImGui::DragFloat3("Scale", model.scale, 0.02f, 0.05f, 5.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::ColorEdit3("Albedo", model.albedo);
+    ImGui::ColorEdit3("Specular color", model.specular);
+    ImGui::SliderFloat("Shininess", &model.shininess, 1.f, 256.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::Checkbox("Procedural vertex colors (Lab 1)", &model.vertex_colors);
 }
 
 Vec3 trajectory(double time, float radius, float phase) {
-	return Vec3{
-		radius * static_cast<float>(std::sin(time * 1.0 + phase)),
-		radius * 0.5f * static_cast<float>(std::sin(time * 2.0 + phase)),
-		radius * static_cast<float>(std::cos(time * 1.0 + phase)),
-	};
+    return {radius * float(std::sin(time + phase)),
+            radius * 0.5f * float(std::sin(time * 2.0 + phase)),
+            radius * float(std::cos(time + phase))};
 }
 
-void updateObjectUniform(uint32_t object_index, const Mat4& mvp, const float color[3]) {
-	UniformBlock block{};
-	std::memcpy(block.mvp, mvp.m, sizeof(block.mvp));
-	block.color[0] = color[0];
-	block.color[1] = color[1];
-	block.color[2] = color[2];
-	block.color[3] = 1.f;
-
-	ObjectResources& object = objects[object_index];
-	std::memcpy(object.uniform_mapped, &block, sizeof(block));
+void updateSceneBuffers(float aspect) {
+    const Mat4 projection = projection_index == 0
+        ? matPerspective(camera_fov, aspect, 0.1f, 100.f)
+        : matOrtho(-ortho_size*aspect, ortho_size*aspect, -ortho_size, ortho_size, 0.1f, 100.f);
+    const Mat4 view_projection = matMultiply(matVulkanClipCorrection(),
+        matMultiply(projection, cameraView(camera_position, camera_angles)));
+    const Mat4 rotation = cameraRotation(camera_angles);
+    SceneUniform scene{};
+    scene.view_projection = view_projection;
+    scene.camera_position = {camera_position[0], camera_position[1], camera_position[2], float(projection_index)};
+    scene.camera_forward = {-rotation.m[8], -rotation.m[9], -rotation.m[10], 0.f};
+    scene.ambient = {ambient_color[0]*ambient_intensity, ambient_color[1]*ambient_intensity,
+                     ambient_color[2]*ambient_intensity, 0.f};
+    scene.directional_direction = lightDirection(directional_angles[0], directional_angles[1]);
+    scene.directional_color = {directional_color[0], directional_color[1], directional_color[2], directional_intensity};
+    if (ensureStorage(point_buffer, point_lights.size(), sizeof(PointLight), 1)) {
+        upload(point_buffer, point_lights.data(), point_lights.size()*sizeof(PointLight));
+        scene.light_counts[0] = static_cast<uint32_t>(point_lights.size());
+    }
+    packed_spots.clear();
+    for (const auto& spot : spot_lights)
+        packed_spots.push_back(makeSpotLight(spot.light, spot.pitch, spot.yaw, spot.inner, spot.outer));
+    if (ensureStorage(spot_buffer, packed_spots.size(), sizeof(SpotLight), 2)) {
+        upload(spot_buffer, packed_spots.data(), packed_spots.size()*sizeof(SpotLight));
+        scene.light_counts[1] = static_cast<uint32_t>(packed_spots.size());
+    }
+    upload(scene_buffer, &scene, sizeof(scene));
+    for (uint32_t i = 0; i < 2; ++i) {
+        const ModelControls& m = models[i];
+        const float phase = i == 0 ? 0.f : 2.4f;
+        const Vec3 offset = subtract(trajectory(animation_time, trajectory_radius, phase),
+                                     trajectory(0.0, trajectory_radius, phase));
+        const Mat4 model = matMultiply(matTranslate(m.position[0]+offset.x, m.position[1]+offset.y, m.position[2]+offset.z),
+            matMultiply(matRotateY(m.rotation[1]+float(animation_time)*(i == 0 ? 45.f : -60.f)),
+            matMultiply(matRotateX(m.rotation[0]), matMultiply(matRotateZ(m.rotation[2]),
+            matScale(m.scale[0], m.scale[1], m.scale[2])))));
+        const ModelUniform data = {model,
+            {m.albedo[0], m.albedo[1], m.albedo[2], m.vertex_colors ? 1.f : 0.f},
+            {m.specular[0], m.specular[1], m.specular[2], m.shininess}};
+        upload(objects[i].uniform, &data, sizeof(data));
+    }
 }
 
-}
+} // namespace
 
 bool initialize() {
-	if (!initializeGraphicsPipeline()) {
-		return false;
-	}
-
-	if (!initializeObjects()) {
-		return false;
-	}
-
-	return true;
+    if (!initializeGraphicsPipeline() || !initializeObjects()) {
+        shutdown();
+        return false;
+    }
+    return true;
 }
 
 void shutdown() {
-	auto& ctx = graphics::internal::context;
-	vkQueueWaitIdle(ctx.graphics_queue);
-
-	vkDestroyPipeline(ctx.device, pipeline, nullptr);
-	vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
-	vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(ctx.device, descriptor_set_layout, nullptr);
-
-	for (ObjectResources& object : objects) {
-		vmaDestroyBuffer(ctx.allocator, object.vertex_buffer, object.vertex_allocation);
-		vmaDestroyBuffer(ctx.allocator, object.index_buffer, object.index_allocation);
-		vmaDestroyBuffer(ctx.allocator, object.uniform_buffer, object.uniform_allocation);
-	}
+    auto& ctx = graphics::internal::context;
+    vkDeviceWaitIdle(ctx.device);
+    vkDestroyPipeline(ctx.device, pipeline, nullptr);
+    vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
+    vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
+    vkDestroyDescriptorSetLayout(ctx.device, scene_layout, nullptr);
+    vkDestroyDescriptorSetLayout(ctx.device, model_layout, nullptr);
+    for (auto& object : objects) {
+        destroyBuffer(object.vertices);
+        destroyBuffer(object.indices);
+        destroyBuffer(object.uniform);
+    }
+    destroyBuffer(scene_buffer);
+    destroyBuffer(point_buffer);
+    destroyBuffer(spot_buffer);
 }
 
 void update(double time) {
-	const double delta = time - last_frame_time;
-	last_frame_time = time;
-
-	if (animation_enabled) {
-		animation_time += delta * animation_speed;
-	}
-
-	ImGui::Begin("Lab 1: Truncated Tetrahedron");
-
-	// Задание 1: переключение проекции
-	const char* projections[] = { "Perspective", "Orthographic" };
-	ImGui::Combo("Projection", &projection_index, projections, IM_ARRAYSIZE(projections));
-
-	// Задание 2: позиция, поворот, масштаб
-	ImGui::DragFloat3("Position", figure_position, 0.05f, -10.f, 10.f, "%.2f");
-	ImGui::DragFloat3("Rotation (deg)", figure_rotation, 1.f, -180.f, 180.f, "%.1f");
-	ImGui::DragFloat3("Scale", figure_scale, 0.02f, 0.05f, 5.f, "%.2f");
-
-	// Задание 3: пауза/воспроизведение, скорость, радиус траектории
-	ImGui::Separator();
-	ImGui::Checkbox("Animate", &animation_enabled);
-	ImGui::SliderFloat("Speed", &animation_speed, 0.f, 3.f, "%.2f");
-	ImGui::SliderFloat("Trajectory radius", &trajectory_radius, 0.f, 5.f, "%.2f");
-
-	// Задание 4: цвет фигуры (умножается на цвета вершин — задание 5)
-	ImGui::Separator();
-	ImGui::ColorEdit3("Figure color", figure_color);
-
-	// Задание 6: вторая фигура со своим набором дескрипторов
-	if (ImGui::CollapsingHeader("Second object")) {
-		ImGui::DragFloat3("Position##2", second_position, 0.05f, -10.f, 10.f, "%.2f");
-		ImGui::DragFloat3("Rotation##2", second_rotation, 1.f, -180.f, 180.f, "%.1f");
-		ImGui::DragFloat3("Scale##2", second_scale, 0.02f, 0.05f, 5.f, "%.2f");
-		ImGui::ColorEdit3("Color##2", second_color);
-	}
-
-	ImGui::Text("Vertices: 12, Faces: 8 (4 hex + 4 tri)");
-	ImGui::Text("Objects: 2 (separate descriptor sets)");
-
-	ImGui::End();
+    const double delta = last_frame_time == 0.0 ? 0.0 : time-last_frame_time;
+    last_frame_time = time;
+    if (animation_enabled) animation_time += delta*animation_speed;
+    ImGui::SetNextWindowSize(ImVec2(370.f, 650.f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Lab 2: Camera and Lighting");
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.48f);
+    if (resource_error) ImGui::TextWrapped("%s", resource_error);
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* projections[] = {"Perspective", "Orthographic"};
+        ImGui::Combo("Projection", &projection_index, projections, 2);
+        ImGui::DragFloat3("Camera position", camera_position, 0.1f);
+        ImGui::DragFloat3("Pitch / yaw / roll", camera_angles, 0.5f);
+        ImGui::SliderFloat("FOV (deg)", &camera_fov, 10.f, 120.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        if (projection_index == 1)
+            ImGui::SliderFloat("Ortho half-height", &ortho_size, 1.f, 20.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::Button("Reset camera")) {
+            camera_position[0] = 0.f; camera_position[1] = 4.f; camera_position[2] = 13.f;
+            camera_angles[0] = -17.f; camera_angles[1] = camera_angles[2] = 0.f;
+            camera_fov = 50.f; ortho_size = 6.f; projection_index = 0;
+        }
+    }
+    if (ImGui::CollapsingHeader("Objects and materials", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int i = 0; i < 2; ++i) {
+            ImGui::PushID(i);
+            if (ImGui::TreeNode("Model", "Tetrahedron %d", i+1)) {
+                editModel(models[i]);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        ImGui::Checkbox("Animate", &animation_enabled);
+        ImGui::SliderFloat("Speed", &animation_speed, 0.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SliderFloat("Trajectory radius", &trajectory_radius, 0.f, 5.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::Button("Reset animation")) { animation_time = 0.0; animation_enabled = false; }
+    }
+    if (ImGui::CollapsingHeader("Ambient and directional light", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::ColorEdit3("Ambient color", ambient_color);
+        ImGui::SliderFloat("Ambient intensity", &ambient_intensity, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::ColorEdit3("Directional color", directional_color);
+        ImGui::SliderFloat("Directional intensity", &directional_intensity, 0.f, 5.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::DragFloat2("Light pitch / yaw", directional_angles, 0.5f);
+    }
+    if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Count: %zu", point_lights.size());
+        ImGui::BeginDisabled(point_lights.size() >= max_storage_range/sizeof(PointLight));
+        if (ImGui::Button("Add point light")) point_lights.push_back({{0.f, 3.f, 4.f, 0.f}, {1.f, 1.f, 1.f, 20.f}});
+        ImGui::EndDisabled();
+        for (size_t i = 0; i < point_lights.size();) {
+            ImGui::PushID(static_cast<int>(i));
+            bool remove = false;
+            if (ImGui::TreeNode("Point", "Point %zu", i+1)) {
+                editLight(point_lights[i]);
+                remove = ImGui::Button("Delete point light");
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+            if (remove) point_lights.erase(point_lights.begin()+i); else ++i;
+        }
+    }
+    if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Count: %zu", spot_lights.size());
+        ImGui::BeginDisabled(spot_lights.size() >= max_storage_range/sizeof(SpotLight));
+        if (ImGui::Button("Add spot light")) spot_lights.push_back(SpotControls{});
+        ImGui::EndDisabled();
+        for (size_t i = 0; i < spot_lights.size();) {
+            ImGui::PushID(static_cast<int>(i));
+            bool remove = false;
+            if (ImGui::TreeNode("Spot", "Spot %zu", i+1)) {
+                auto& spot = spot_lights[i];
+                editLight(spot.light);
+                ImGui::DragFloat("Pitch (deg)", &spot.pitch, 0.5f);
+                ImGui::DragFloat("Yaw (deg)", &spot.yaw, 0.5f);
+                if (ImGui::SliderFloat("Inner half-angle", &spot.inner, 0.f, 89.f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp))
+                    spot.outer = std::max(spot.inner, spot.outer);
+                if (ImGui::SliderFloat("Outer half-angle", &spot.outer, 0.f, 89.f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp))
+                    spot.inner = std::min(spot.inner, spot.outer);
+                remove = ImGui::Button("Delete spot light");
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+            if (remove) spot_lights.erase(spot_lights.begin()+i); else ++i;
+        }
+    }
+    ImGui::PopItemWidth();
+    ImGui::End();
 }
 
 void render(const graphics::internal::FrameData& fd) {
-	auto& ctx = graphics::internal::context;
-
-	if (fd.command_buffer == VK_NULL_HANDLE || fd.framebuffer == VK_NULL_HANDLE) {
-		return;
-	}
-
-	const float aspect = float(ctx.swapchain_extent.width) /
-						 float(ctx.swapchain_extent.height);
-
-	// Доп. задание 1: перспективная или ортографическая проекция
-	const Mat4 projection = projection_index == 0
-		? matPerspective(50.f, aspect, 0.1f, 100.f)
-		: matOrtho(-6.f * aspect, 6.f * aspect, -6.f, 6.f, 0.1f, 100.f);
-
-	const Mat4 view = matLookAt(Vec3{ 0.f, 3.f, 9.f }, Vec3{ 0.f, 0.f, 0.f },
-								Vec3{ 0.f, 1.f, 0.f });
-
-	const Mat4 vulkan_clip = matVulkanClipCorrection();
-	const Mat4 view_projection = matMultiply(vulkan_clip, matMultiply(projection, view));
-
-	// Объект 0: модель = T * Ry * Rx * Rz * S.
-	// К трансформациям пользователя добавляется смещение по траектории
-	// и собственное вращение фигуры (задание 3)
-	const Vec3 trajectory_offset = trajectory(animation_time, trajectory_radius, 0.0);
-	const Vec3 position = {
-		figure_position[0] + trajectory_offset.x,
-		figure_position[1] + trajectory_offset.y,
-		figure_position[2] + trajectory_offset.z,
-	};
-
-	Mat4 model = matMultiply(matTranslate(position.x, position.y, position.z),
-							 matMultiply(matRotateY(figure_rotation[1] + float(animation_time) * 90.f),
-							 matMultiply(matRotateX(figure_rotation[0]),
-							 matMultiply(matRotateZ(figure_rotation[2]),
-										 matScale(figure_scale[0], figure_scale[1], figure_scale[2])))));
-
-	const Mat4 mvp0 = matMultiply(view_projection, model);
-	updateObjectUniform(0, mvp0, figure_color);
-
-	// Объект 1: вторая фигура, независимая траектория и обратное вращение
-	const Vec3 trajectory1 = trajectory(animation_time, trajectory_radius * 0.7f, 2.4);
-	const Vec3 position1 = {
-		second_position[0] + trajectory1.x,
-		second_position[1] + trajectory1.y,
-		second_position[2] + trajectory1.z,
-	};
-
-	Mat4 model1 = matMultiply(matTranslate(position1.x, position1.y, position1.z),
-							  matMultiply(matRotateY(second_rotation[1] - float(animation_time) * 120.f),
-							  matMultiply(matRotateX(second_rotation[0] + float(animation_time) * 60.f),
-							  matMultiply(matRotateZ(second_rotation[2]),
-										  matScale(second_scale[0], second_scale[1], second_scale[2])))));
-
-	const Mat4 mvp1 = matMultiply(view_projection, model1);
-	updateObjectUniform(1, mvp1, second_color);
-
+    auto& ctx = graphics::internal::context;
+    if (fd.command_buffer == VK_NULL_HANDLE || fd.framebuffer == VK_NULL_HANDLE) return;
+    updateSceneBuffers(float(ctx.swapchain_extent.width)/float(ctx.swapchain_extent.height));
 	// Запись команд отрисовки
 	vkResetCommandBuffer(fd.command_buffer, 0);
 
@@ -803,14 +620,15 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
 	vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 
-	// Отрисовка обоих объектов: у каждого свой VkDescriptorSet (адание 6)
+	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		pipeline_layout, 0, 1, &scene_set, 0, nullptr);
 	for (const ObjectResources& object : objects) {
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-								pipeline_layout, 0, 1, &object.descriptor_set, 0, nullptr);
+								pipeline_layout, 1, 1, &object.descriptor_set, 0, nullptr);
 
 		const VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.vertex_buffer, &offset);
-		vkCmdBindIndexBuffer(fd.command_buffer, object.index_buffer, 0,
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.vertices.handle, &offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, object.indices.handle, 0,
 							 VK_INDEX_TYPE_UINT16);
 
 		vkCmdDrawIndexed(fd.command_buffer, object.index_count, 1, 0, 0, 0);
