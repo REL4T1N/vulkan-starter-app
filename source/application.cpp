@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <imgui.h>
 
@@ -17,8 +18,11 @@ struct Buffer {
     VkDeviceSize size = 0;
 };
 struct ObjectResources {
-    Buffer vertices, indices, uniform;
+    Buffer uniform;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+};
+struct MeshResources {
+    Buffer vertices, indices;
     uint32_t index_count = 0;
 };
 struct ModelControls {
@@ -44,6 +48,7 @@ VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 VkDescriptorSet scene_set = VK_NULL_HANDLE;
 Buffer scene_buffer, point_buffer, spot_buffer;
 ObjectResources objects[2];
+MeshResources geometry;
 VkDeviceSize max_storage_range = 0;
 const char* resource_error = nullptr;
 
@@ -89,7 +94,7 @@ void destroyBuffer(Buffer& buffer) {
     buffer = {};
 }
 
-bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage) {
+bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, bool device_local = false) {
     const VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
@@ -97,8 +102,10 @@ bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage) {
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     const VmaAllocationCreateInfo allocation = {
-        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = device_local ? VmaAllocationCreateFlags(0) :
+            VmaAllocationCreateFlags(VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT),
+        .usage = device_local ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .requiredFlags = device_local ? VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) : VkMemoryPropertyFlags(0),
     };
     VmaAllocationInfo mapped{};
     if (vmaCreateBuffer(graphics::internal::context.allocator, &info, &allocation,
@@ -150,15 +157,81 @@ bool ensureStorage(Buffer& buffer, size_t count, size_t stride, uint32_t binding
     return true;
 }
 
-bool createObjectResources(ObjectResources& object, const Mesh& mesh) {
-    object.index_count = static_cast<uint32_t>(mesh.indices.size());
-    if (!createBuffer(object.vertices, mesh.vertices.size()*sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
-        !createBuffer(object.indices, mesh.indices.size()*sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT) ||
-        !createBuffer(object.uniform, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
-    upload(object.vertices, mesh.vertices.data(), mesh.vertices.size()*sizeof(Vertex));
-    upload(object.indices, mesh.indices.data(), mesh.indices.size()*sizeof(uint16_t));
-    bindBuffer(object.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, object.uniform);
-    return true;
+// Initialization uploads use the graphics queue, avoiding queue-family ownership transfers.
+// The staging allocation stays alive until the fence signals completion.
+bool transferToGpu(const void* data, VkDeviceSize size,
+                   const std::function<void(VkCommandBuffer, VkBuffer)>& record) {
+    auto& ctx = graphics::internal::context;
+    Buffer staging;
+    if (!createBuffer(staging, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return false;
+    upload(staging, data, size);
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    const bool success = [&] {
+        if (resource_error) return false;
+        const VkCommandPoolCreateInfo pool_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = ctx.graphics_queue_index,
+        };
+        if (vkCreateCommandPool(ctx.device, &pool_info, nullptr, &pool) != VK_SUCCESS) return false;
+        const VkCommandBufferAllocateInfo allocate = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+        };
+        VkCommandBuffer cmd;
+        if (vkAllocateCommandBuffers(ctx.device, &allocate, &cmd) != VK_SUCCESS) return false;
+        const VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return false;
+        record(cmd, staging.handle);
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+        const VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(ctx.device, &fence_info, nullptr, &fence) != VK_SUCCESS) return false;
+        const VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd,
+        };
+        if (vkQueueSubmit(ctx.graphics_queue, 1, &submit, fence) != VK_SUCCESS) return false;
+        const VkResult result = vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) vkDeviceWaitIdle(ctx.device);
+        return result == VK_SUCCESS;
+    }();
+    vkDestroyFence(ctx.device, fence, nullptr);
+    vkDestroyCommandPool(ctx.device, pool, nullptr);
+    destroyBuffer(staging);
+    if (!success) {
+        resource_error = "Could not upload resource to GPU.";
+        std::cerr << resource_error << '\n';
+    }
+    return success;
+}
+
+bool createGeometryBuffer(Buffer& buffer, const void* data, VkDeviceSize size,
+                          VkBufferUsageFlags usage, VkAccessFlags access) {
+    if (!createBuffer(buffer, size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return false;
+    return transferToGpu(data, size, [&](VkCommandBuffer cmd, VkBuffer staging) {
+        const VkBufferCopy copy = {.size = size};
+        vkCmdCopyBuffer(cmd, staging, buffer.handle, 1, &copy);
+        const VkBufferMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = access,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer.handle, .offset = 0, .size = size,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+    });
+}
+
+bool createGeometry(const Mesh& mesh) {
+    geometry.index_count = static_cast<uint32_t>(mesh.indices.size());
+    return createGeometryBuffer(geometry.vertices, mesh.vertices.data(), mesh.vertices.size()*sizeof(Vertex),
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT) &&
+           createGeometryBuffer(geometry.indices, mesh.indices.data(), mesh.indices.size()*sizeof(uint16_t),
+                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_ACCESS_INDEX_READ_BIT);
 }
 
 bool initializeGraphicsPipeline() {
@@ -383,9 +456,10 @@ bool initializeObjects() {
     bindBuffer(scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_buffer);
     if (!ensureStorage(point_buffer, point_lights.size(), sizeof(PointLight), 1) ||
         !ensureStorage(spot_buffer, spot_lights.size(), sizeof(SpotLight), 2)) return false;
-    const Mesh mesh = makeTruncatedTetrahedron();
+    if (!createGeometry(makeTruncatedTetrahedron())) return false;
     for (auto& object : objects) {
-        if (!createObjectResources(object, mesh)) return false;
+        if (!createBuffer(object.uniform, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
+        bindBuffer(object.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, object.uniform);
     }
     return true;
 }
@@ -474,10 +548,10 @@ void shutdown() {
     vkDestroyDescriptorSetLayout(ctx.device, scene_layout, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, model_layout, nullptr);
     for (auto& object : objects) {
-        destroyBuffer(object.vertices);
-        destroyBuffer(object.indices);
         destroyBuffer(object.uniform);
     }
+    destroyBuffer(geometry.vertices);
+    destroyBuffer(geometry.indices);
     destroyBuffer(scene_buffer);
     destroyBuffer(point_buffer);
     destroyBuffer(spot_buffer);
@@ -627,11 +701,11 @@ void render(const graphics::internal::FrameData& fd) {
 								pipeline_layout, 1, 1, &object.descriptor_set, 0, nullptr);
 
 		const VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.vertices.handle, &offset);
-		vkCmdBindIndexBuffer(fd.command_buffer, object.indices.handle, 0,
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &geometry.vertices.handle, &offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, geometry.indices.handle, 0,
 							 VK_INDEX_TYPE_UINT16);
 
-		vkCmdDrawIndexed(fd.command_buffer, object.index_count, 1, 0, 0, 0);
+		vkCmdDrawIndexed(fd.command_buffer, geometry.index_count, 1, 0, 0, 0);
 	}
 
 	vkCmdEndRenderPass(fd.command_buffer);
