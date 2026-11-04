@@ -26,8 +26,16 @@ struct Texture {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 };
-Texture texture;
+struct TextureSource { const char* name; const char* path; };
+constexpr TextureSource texture_sources[] = {
+    {"UV grid", "textures/grid.png"},
+    {"Terracotta tiles", "textures/tiles.png"},
+    {"Blue waves", "textures/waves.png"},
+};
+constexpr uint32_t texture_count = static_cast<uint32_t>(std::size(texture_sources));
+Texture textures[texture_count];
 VkSampler texture_sampler = VK_NULL_HANDLE;
 
 struct ModelControls {
@@ -37,6 +45,7 @@ struct ModelControls {
     float albedo[3];
     float specular[3] = {0.8f, 0.8f, 0.8f};
     float shininess = 32.f;
+    int texture_index = 0;
 };
 struct SpotControls {
     PointLight light = {{0.f, 5.f, 5.f, 0.f}, {1.f, 0.85f, 0.6f, 35.f}};
@@ -53,7 +62,6 @@ VkDescriptorSet scene_set = VK_NULL_HANDLE;
 Buffer scene_buffer, point_buffer, spot_buffer;
 Buffer model_buffer;
 VkDeviceSize model_stride = 0;
-VkDescriptorSet model_set = VK_NULL_HANDLE;
 MeshResources geometry;
 VkDeviceSize max_storage_range = 0;
 const char* resource_error = nullptr;
@@ -301,9 +309,8 @@ bool loadTexture(Texture& texture, const char* path) {
     return vkCreateImageView(ctx.device, &view, nullptr, &texture.view) == VK_SUCCESS;
 }
 
-bool initializeTexture() {
+bool initializeTextures() {
     auto& ctx = graphics::internal::context;
-    if (!loadTexture(texture, "textures/grid.png")) return false;
     const VkSamplerCreateInfo sampler = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
@@ -313,16 +320,21 @@ bool initializeTexture() {
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .maxLod = 0.f,
     };
     if (vkCreateSampler(ctx.device, &sampler, nullptr, &texture_sampler) != VK_SUCCESS) return false;
-    const VkDescriptorImageInfo image = {
-        .sampler = texture_sampler, .imageView = texture.view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    };
-    const VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = model_set,
-        .dstBinding = 1, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image,
-    };
-    vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
+    for (uint32_t i = 0; i < texture_count; ++i) {
+        auto& texture = textures[i];
+        if (!loadTexture(texture, texture_sources[i].path)) return false;
+        const VkDescriptorImageInfo image = {
+            .sampler = texture_sampler, .imageView = texture.view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = texture.descriptor_set,
+            .dstBinding = 1, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image,
+        };
+        vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
+    }
+    models[1].texture_index = 1;
     return true;
 }
 
@@ -531,35 +543,38 @@ bool initializeObjects() {
     model_stride = (sizeof(ModelUniform) + alignment - 1) / alignment * alignment;
     const VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, texture_count},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2,
+        .maxSets = 1 + texture_count,
         .poolSizeCount = 4,
         .pPoolSizes = sizes,
     };
     if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
+    VkDescriptorSetLayout layouts[1 + texture_count];
+    layouts[0] = scene_layout;
+    std::fill(std::begin(layouts) + 1, std::end(layouts), model_layout);
     const VkDescriptorSetAllocateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptor_pool,
-        .descriptorSetCount = 2,
+        .descriptorSetCount = 1 + texture_count,
         .pSetLayouts = layouts,
     };
-    VkDescriptorSet sets[2]{};
+    VkDescriptorSet sets[1 + texture_count]{};
     if (vkAllocateDescriptorSets(ctx.device, &info, sets) != VK_SUCCESS) return false;
     scene_set = sets[0];
-    model_set = sets[1];
+    for (uint32_t i = 0; i < texture_count; ++i) textures[i].descriptor_set = sets[i + 1];
     if (!createBuffer(scene_buffer, sizeof(SceneUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
     bindBuffer(scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_buffer);
     if (!ensureStorage(point_buffer, point_lights.size(), sizeof(PointLight), 1) ||
         !ensureStorage(spot_buffer, spot_lights.size(), sizeof(SpotLight), 2)) return false;
     if (!createGeometry(makeTruncatedTetrahedron())) return false;
     if (!createBuffer(model_buffer, model_stride * std::size(models), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
-    bindBuffer(model_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, model_buffer, sizeof(ModelUniform));
+    for (auto& texture : textures)
+        bindBuffer(texture.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, model_buffer, sizeof(ModelUniform));
     return true;
 }
 
@@ -573,6 +588,14 @@ void editModel(ModelControls& model) {
     ImGui::DragFloat3("Position", model.position, 0.05f);
     ImGui::DragFloat3("Rotation (deg)", model.rotation, 1.f);
     ImGui::DragFloat3("Scale", model.scale, 0.02f, 0.05f, 5.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::BeginCombo("Albedo texture", texture_sources[model.texture_index].name)) {
+        for (uint32_t i = 0; i < texture_count; ++i) {
+            const bool selected = model.texture_index == static_cast<int>(i);
+            if (ImGui::Selectable(texture_sources[i].name, selected)) model.texture_index = static_cast<int>(i);
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
     ImGui::ColorEdit3("Texture tint", model.albedo);
     ImGui::ColorEdit3("Specular color", model.specular);
     ImGui::SliderFloat("Shininess", &model.shininess, 1.f, 256.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
@@ -630,7 +653,7 @@ void updateSceneBuffers(float aspect) {
 } // namespace
 
 bool initialize() {
-    if (!initializeGraphicsPipeline() || !initializeObjects() || !initializeTexture()) {
+    if (!initializeGraphicsPipeline() || !initializeObjects() || !initializeTextures()) {
         shutdown();
         return false;
     }
@@ -646,8 +669,11 @@ void shutdown() {
     vkDestroyDescriptorSetLayout(ctx.device, scene_layout, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, model_layout, nullptr);
     vkDestroySampler(ctx.device, texture_sampler, nullptr);
-    vkDestroyImageView(ctx.device, texture.view, nullptr);
-    if (texture.image) vmaDestroyImage(ctx.allocator, texture.image, texture.allocation);
+    for (auto& texture : textures) {
+        vkDestroyImageView(ctx.device, texture.view, nullptr);
+        if (texture.image) vmaDestroyImage(ctx.allocator, texture.image, texture.allocation);
+        texture = {};
+    }
     destroyBuffer(model_buffer);
     destroyBuffer(geometry.vertices);
     destroyBuffer(geometry.indices);
@@ -798,7 +824,7 @@ void render(const graphics::internal::FrameData& fd) {
 	for (uint32_t i = 0; i < std::size(models); ++i) {
         const uint32_t dynamic_offset = static_cast<uint32_t>(i * model_stride);
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-								pipeline_layout, 1, 1, &model_set, 1, &dynamic_offset);
+								pipeline_layout, 1, 1, &textures[models[i].texture_index].descriptor_set, 1, &dynamic_offset);
 
 		const VkDeviceSize offset = 0;
 		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &geometry.vertices.handle, &offset);
