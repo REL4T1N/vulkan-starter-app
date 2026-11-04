@@ -2,6 +2,42 @@
 
 ## Getting started
 
+### Arch Linux
+
+Install the build tools, Vulkan development files and the dependencies needed by
+GLFW's Wayland and X11 backends:
+
+```bash
+sudo pacman -Syu --needed base-devel git cmake ninja shaderc vulkan-headers vulkan-icd-loader vulkan-tools vulkan-validation-layers wayland wayland-protocols libxkbcommon libx11 libxrandr libxinerama libxcursor libxi
+```
+
+A Vulkan driver for your GPU is also required. On the tested AMD Radeon 760M,
+install `vulkan-radeon` if it is not already installed:
+
+```bash
+sudo pacman -S --needed vulkan-radeon
+vulkaninfo --summary
+```
+
+Check that `vulkaninfo` lists your GPU with API version 1.1 or later. A newer
+Vulkan version satisfies this requirement; a separate Vulkan 1.1 SDK is not needed.
+
+Run these commands from the repository root:
+
+```bash
+cmake --preset debug
+cmake --build build-debug --parallel 4
+./build-debug/vulkan-starter-app
+```
+
+The first configure downloads the pinned GLFW, vk-bootstrap, Vulkan Memory
+Allocator and ImGui sources from GitHub, so it requires internet access. The build
+also compiles the shaders using `glslc` from `shaderc`. Keep the repository root as
+the working directory when launching the app so it can find `shaders/*.spv`.
+For an optimized build, use the `release` preset and `build-release` directory.
+
+### General prerequisites
+
 You need C++ compiler, Vulkan SDK and CMake installed before you can build this project.
 
 This project uses C++20 standard and thus requires either of those compilers:
