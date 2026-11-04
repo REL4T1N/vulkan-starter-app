@@ -236,6 +236,14 @@ inline Mesh makeTruncatedTetrahedron() {
 }
 
 // All GPU records use 16-byte fields; these offsets match std140/std430 in GLSL.
+struct SamplingPushConstants {
+    uint32_t enabled;
+    float time;
+    float blend;
+    float scale;
+};
+static_assert(sizeof(SamplingPushConstants) == 16 && offsetof(SamplingPushConstants, scale) == 12);
+
 struct alignas(16) Float4 { float x, y, z, w; };
 struct alignas(16) SceneUniform {
     Mat4 view_projection;

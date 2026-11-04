@@ -8,6 +8,27 @@ layout(location = 2) in vec2 textureUV;
 layout(set = 1, binding = 1) uniform sampler2D albedoTexture;
 layout(location = 0) out vec4 outColor;
 
+layout(push_constant) uniform SamplingParameters {
+    uint enabled;
+    float time;
+    float blend;
+    float scale;
+} sampling;
+
+vec3 sampleAlbedo() {
+    if (sampling.enabled == 0u) return texture(albedoTexture, textureUV).rgb;
+    // Both samples read the same image, with independently animated coordinates.
+    vec2 firstUV = textureUV + vec2(0.07, -0.04) * sampling.time;
+    float angle = 0.3 * sin(0.5 * sampling.time);
+    mat2 rotation = mat2(cos(angle), sin(angle), -sin(angle), cos(angle));
+    vec2 secondUV = rotation * (textureUV - 0.5) * sampling.scale + 0.5
+                  + vec2(-0.05, 0.08) * sampling.time;
+    vec3 first = texture(albedoTexture, firstUV).rgb;
+    vec3 second = texture(albedoTexture, secondUV).rgb;
+    vec3 modulation = 0.8 + 0.2 * sin(vec3(0.0, 2.094, 4.189) + sampling.time);
+    return mix(first, second, sampling.blend) * modulation;
+}
+
 struct PointLight {
     vec4 position;
     vec4 color; // rgb = color, w = intensity
@@ -37,7 +58,7 @@ void main() {
     vec3 N = safeNormalize(worldNormal);
     vec3 V = scene.cameraPosition.w > 0.5
         ? -scene.cameraForward.xyz : safeNormalize(scene.cameraPosition.xyz - worldPosition);
-    vec3 albedo = material.albedo.rgb * texture(albedoTexture, textureUV).rgb;
+    vec3 albedo = material.albedo.rgb * sampleAlbedo();
     vec3 color = scene.ambient.rgb * albedo;
     color += blinnPhong(N, V, -scene.directionalDirection.xyz,
                        scene.directionalColor.rgb * scene.directionalColor.w, albedo);

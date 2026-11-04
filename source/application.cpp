@@ -46,6 +46,12 @@ struct ModelControls {
     float specular[3] = {0.8f, 0.8f, 0.8f};
     float shininess = 32.f;
     int texture_index = 0;
+    bool sampling_effect = false;
+    bool sampling_paused = false;
+    float sampling_speed = 1.f;
+    float sampling_blend = 0.5f;
+    float sampling_scale = 2.f;
+    double sampling_time = 0.0;
 };
 struct SpotControls {
     PointLight light = {{0.f, 5.f, 5.f, 0.f}, {1.f, 0.85f, 0.6f, 35.f}};
@@ -335,6 +341,7 @@ bool initializeTextures() {
         vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
     }
     models[1].texture_index = 1;
+    models[1].sampling_effect = true;
     return true;
 }
 
@@ -360,10 +367,14 @@ bool initializeGraphicsPipeline() {
     layout_info.bindingCount = 2;
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &model_layout) != VK_SUCCESS) return false;
     const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
+    const VkPushConstantRange sampling_range = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = sizeof(SamplingPushConstants),
+    };
     const VkPipelineLayoutCreateInfo pipeline_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 2,
         .pSetLayouts = layouts,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &sampling_range,
     };
     if (vkCreatePipelineLayout(ctx.device, &pipeline_layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) return false;
 	std::vector<uint32_t> vert_code;
@@ -596,6 +607,14 @@ void editModel(ModelControls& model) {
         }
         ImGui::EndCombo();
     }
+    ImGui::Checkbox("Animated sampling", &model.sampling_effect);
+    if (model.sampling_effect) {
+        ImGui::Checkbox("Pause texture animation", &model.sampling_paused);
+        ImGui::SliderFloat("Texture speed", &model.sampling_speed, 0.f, 3.f);
+        ImGui::SliderFloat("Sample blend", &model.sampling_blend, 0.f, 1.f);
+        ImGui::SliderFloat("Second sample scale", &model.sampling_scale, 0.5f, 4.f);
+        if (ImGui::Button("Reset texture animation")) model.sampling_time = 0.0;
+    }
     ImGui::ColorEdit3("Texture tint", model.albedo);
     ImGui::ColorEdit3("Specular color", model.specular);
     ImGui::SliderFloat("Shininess", &model.shininess, 1.f, 256.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
@@ -686,6 +705,9 @@ void update(double time) {
     const double delta = last_frame_time == 0.0 ? 0.0 : time-last_frame_time;
     last_frame_time = time;
     if (animation_enabled) animation_time += delta*animation_speed;
+    for (auto& model : models)
+        if (model.sampling_effect && !model.sampling_paused)
+            model.sampling_time += delta * model.sampling_speed;
     ImGui::SetNextWindowSize(ImVec2(370.f, 650.f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_FirstUseEver);
     ImGui::Begin("Lab 3: Texture Mapping");
@@ -823,6 +845,11 @@ void render(const graphics::internal::FrameData& fd) {
 		pipeline_layout, 0, 1, &scene_set, 0, nullptr);
 	for (uint32_t i = 0; i < std::size(models); ++i) {
         const uint32_t dynamic_offset = static_cast<uint32_t>(i * model_stride);
+        const auto& model = models[i];
+        const SamplingPushConstants sampling = {model.sampling_effect ? 1u : 0u,
+            static_cast<float>(model.sampling_time), model.sampling_blend, model.sampling_scale};
+        vkCmdPushConstants(fd.command_buffer, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(sampling), &sampling);
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 								pipeline_layout, 1, 1, &textures[models[i].texture_index].descriptor_set, 1, &dynamic_offset);
 
