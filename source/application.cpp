@@ -17,10 +17,6 @@ struct Buffer {
     void* mapped = nullptr;
     VkDeviceSize size = 0;
 };
-struct ObjectResources {
-    Buffer uniform;
-    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-};
 struct MeshResources {
     Buffer vertices, indices;
     uint32_t index_count = 0;
@@ -47,7 +43,9 @@ VkDescriptorSetLayout model_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 VkDescriptorSet scene_set = VK_NULL_HANDLE;
 Buffer scene_buffer, point_buffer, spot_buffer;
-ObjectResources objects[2];
+Buffer model_buffer;
+VkDeviceSize model_stride = 0;
+VkDescriptorSet model_set = VK_NULL_HANDLE;
 MeshResources geometry;
 VkDeviceSize max_storage_range = 0;
 const char* resource_error = nullptr;
@@ -119,17 +117,18 @@ bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, b
     return true;
 }
 
-void upload(const Buffer& buffer, const void* data, size_t size) {
+void upload(const Buffer& buffer, const void* data, size_t size, VkDeviceSize offset = 0) {
     if (size == 0) return;
-    std::memcpy(buffer.mapped, data, size);
-    if (vmaFlushAllocation(graphics::internal::context.allocator, buffer.allocation, 0, size) != VK_SUCCESS) {
+    std::memcpy(static_cast<char*>(buffer.mapped) + offset, data, size);
+    if (vmaFlushAllocation(graphics::internal::context.allocator, buffer.allocation, offset, size) != VK_SUCCESS) {
         resource_error = "Could not flush GPU buffer memory.";
         std::cerr << resource_error << '\n';
     }
 }
 
-void bindBuffer(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const Buffer& buffer) {
-    const VkDescriptorBufferInfo info = {.buffer = buffer.handle, .offset = 0, .range = buffer.size};
+void bindBuffer(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const Buffer& buffer, VkDeviceSize range = VK_WHOLE_SIZE) {
+    const VkDescriptorBufferInfo info = {.buffer = buffer.handle, .offset = 0,
+        .range = range == VK_WHOLE_SIZE ? buffer.size : range};
     const VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set,
@@ -247,6 +246,11 @@ bool initializeGraphicsPipeline() {
         .pBindings = scene_bindings,
     };
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &scene_layout) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayoutBinding model_binding = {
+        0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr,
+    };
+    layout_info.pBindings = &model_binding;
     layout_info.bindingCount = 1;
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &model_layout) != VK_SUCCESS) return false;
     const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
@@ -429,38 +433,38 @@ bool initializeObjects() {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(ctx.physical_device, &properties);
     max_storage_range = properties.limits.maxStorageBufferRange;
+    const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+    model_stride = (sizeof(ModelUniform) + alignment - 1) / alignment * alignment;
     const VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 3,
-        .poolSizeCount = 2,
+        .maxSets = 2,
+        .poolSizeCount = 3,
         .pPoolSizes = sizes,
     };
     if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout, model_layout};
+    const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
     const VkDescriptorSetAllocateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptor_pool,
-        .descriptorSetCount = 3,
+        .descriptorSetCount = 2,
         .pSetLayouts = layouts,
     };
-    VkDescriptorSet sets[3]{};
+    VkDescriptorSet sets[2]{};
     if (vkAllocateDescriptorSets(ctx.device, &info, sets) != VK_SUCCESS) return false;
     scene_set = sets[0];
-    objects[0].descriptor_set = sets[1];
-    objects[1].descriptor_set = sets[2];
+    model_set = sets[1];
     if (!createBuffer(scene_buffer, sizeof(SceneUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
     bindBuffer(scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_buffer);
     if (!ensureStorage(point_buffer, point_lights.size(), sizeof(PointLight), 1) ||
         !ensureStorage(spot_buffer, spot_lights.size(), sizeof(SpotLight), 2)) return false;
     if (!createGeometry(makeTruncatedTetrahedron())) return false;
-    for (auto& object : objects) {
-        if (!createBuffer(object.uniform, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
-        bindBuffer(object.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, object.uniform);
-    }
+    if (!createBuffer(model_buffer, model_stride * std::size(models), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
+    bindBuffer(model_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, model_buffer, sizeof(ModelUniform));
     return true;
 }
 
@@ -525,7 +529,7 @@ void updateSceneBuffers(float aspect) {
         const ModelUniform data = {model,
             {m.albedo[0], m.albedo[1], m.albedo[2], m.vertex_colors ? 1.f : 0.f},
             {m.specular[0], m.specular[1], m.specular[2], m.shininess}};
-        upload(objects[i].uniform, &data, sizeof(data));
+        upload(model_buffer, &data, sizeof(data), i * model_stride);
     }
 }
 
@@ -547,9 +551,7 @@ void shutdown() {
     vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, scene_layout, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, model_layout, nullptr);
-    for (auto& object : objects) {
-        destroyBuffer(object.uniform);
-    }
+    destroyBuffer(model_buffer);
     destroyBuffer(geometry.vertices);
     destroyBuffer(geometry.indices);
     destroyBuffer(scene_buffer);
@@ -696,9 +698,10 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		pipeline_layout, 0, 1, &scene_set, 0, nullptr);
-	for (const ObjectResources& object : objects) {
+	for (uint32_t i = 0; i < std::size(models); ++i) {
+        const uint32_t dynamic_offset = static_cast<uint32_t>(i * model_stride);
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-								pipeline_layout, 1, 1, &object.descriptor_set, 0, nullptr);
+								pipeline_layout, 1, 1, &model_set, 1, &dynamic_offset);
 
 		const VkDeviceSize offset = 0;
 		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &geometry.vertices.handle, &offset);

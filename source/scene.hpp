@@ -244,10 +244,10 @@ struct alignas(16) SpotLight {
     Float4 direction; // w = cos(inner half-angle)
     Float4 cone; // x = cos(outer half-angle)
 };
-// static_assert(sizeof(SceneUniform) == 160 && offsetof(SceneUniform, light_counts) == 144);
-// static_assert(sizeof(ModelUniform) == 96 && offsetof(ModelUniform, albedo) == 64);
-// static_assert(sizeof(PointLight) == 32 && offsetof(PointLight, color) == 16);
-// static_assert(sizeof(SpotLight) == 64 && offsetof(SpotLight, direction) == 32);
+static_assert(sizeof(SceneUniform) == 160 && offsetof(SceneUniform, light_counts) == 144);
+static_assert(sizeof(ModelUniform) == 96 && offsetof(ModelUniform, albedo) == 64);
+static_assert(sizeof(PointLight) == 32 && offsetof(PointLight, color) == 16);
+static_assert(sizeof(SpotLight) == 64 && offsetof(SpotLight, direction) == 32);
 
 inline Mat4 cameraRotation(const float angles[3]) {
     return matMultiply(matRotateY(angles[1]), matMultiply(matRotateX(angles[0]), matRotateZ(angles[2])));
