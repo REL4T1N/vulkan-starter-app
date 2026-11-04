@@ -4,7 +4,8 @@
 
 layout(location = 0) in vec3 worldPosition;
 layout(location = 1) in vec3 worldNormal;
-layout(location = 2) in vec3 vertexColor;
+layout(location = 2) in vec2 textureUV;
+layout(set = 1, binding = 1) uniform sampler2D albedoTexture;
 layout(location = 0) out vec4 outColor;
 
 struct PointLight {
@@ -36,7 +37,7 @@ void main() {
     vec3 N = safeNormalize(worldNormal);
     vec3 V = scene.cameraPosition.w > 0.5
         ? -scene.cameraForward.xyz : safeNormalize(scene.cameraPosition.xyz - worldPosition);
-    vec3 albedo = material.albedo.rgb * mix(vec3(1.0), vertexColor, material.albedo.w);
+    vec3 albedo = material.albedo.rgb * texture(albedoTexture, textureUV).rgb;
     vec3 color = scene.ambient.rgb * albedo;
     color += blinnPhong(N, V, -scene.directionalDirection.xyz,
                        scene.directionalColor.rgb * scene.directionalColor.w, albedo);

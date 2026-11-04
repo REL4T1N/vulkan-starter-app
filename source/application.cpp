@@ -6,6 +6,7 @@
 #include <functional>
 #include <iostream>
 #include <imgui.h>
+#include <lodepng.h>
 
 namespace application {
 namespace {
@@ -21,6 +22,14 @@ struct MeshResources {
     Buffer vertices, indices;
     uint32_t index_count = 0;
 };
+struct Texture {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+Texture texture;
+VkSampler texture_sampler = VK_NULL_HANDLE;
+
 struct ModelControls {
     float position[3];
     float rotation[3];
@@ -28,7 +37,6 @@ struct ModelControls {
     float albedo[3];
     float specular[3] = {0.8f, 0.8f, 0.8f};
     float shininess = 32.f;
-    bool vertex_colors = false;
 };
 struct SpotControls {
     PointLight light = {{0.f, 5.f, 5.f, 0.f}, {1.f, 0.85f, 0.6f, 35.f}};
@@ -51,8 +59,8 @@ VkDeviceSize max_storage_range = 0;
 const char* resource_error = nullptr;
 
 ModelControls models[2] = {
-    {{-2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.65f, 0.65f, 0.65f}, {0.25f, 0.55f, 0.85f}},
-    {{ 2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}, {0.85f, 0.4f, 0.15f}},
+    {{-2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.65f, 0.65f, 0.65f}, {1.f, 1.f, 1.f}},
+    {{ 2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}, {1.f, 1.f, 1.f}},
 };
 float camera_position[3] = {0.f, 4.f, 13.f};
 float camera_angles[3] = {-17.f, 0.f, 0.f}; // pitch, yaw, roll in degrees
@@ -233,6 +241,91 @@ bool createGeometry(const Mesh& mesh) {
                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_ACCESS_INDEX_READ_BIT);
 }
 
+bool loadTexture(Texture& texture, const char* path) {
+    auto& ctx = graphics::internal::context;
+    std::vector<unsigned char> pixels;
+    unsigned width = 0, height = 0;
+    const unsigned error = lodepng::decode(pixels, width, height, path);
+    if (error) {
+        std::cerr << "Cannot load texture " << path << ": " << lodepng_error_text(error) << '\n';
+        return false;
+    }
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(ctx.physical_device, &properties);
+    if (!width || !height || width > properties.limits.maxImageDimension2D ||
+        height > properties.limits.maxImageDimension2D) {
+        std::cerr << "Texture dimensions exceed GPU limits: " << path << '\n';
+        return false;
+    }
+    const VkImageCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_SRGB, .extent = {width, height, 1},
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo allocation = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    };
+    if (vmaCreateImage(ctx.allocator, &info, &allocation, &texture.image, &texture.allocation, nullptr) != VK_SUCCESS)
+        return false;
+    if (!transferToGpu(pixels.data(), pixels.size(), [&](VkCommandBuffer cmd, VkBuffer staging) {
+        VkImageMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = texture.image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+        const VkBufferImageCopy copy = {
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {width, height, 1},
+        };
+        vkCmdCopyBufferToImage(cmd, staging, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    })) return false;
+    const VkImageViewCreateInfo view = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = texture.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = info.format,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    return vkCreateImageView(ctx.device, &view, nullptr, &texture.view) == VK_SUCCESS;
+}
+
+bool initializeTexture() {
+    auto& ctx = graphics::internal::context;
+    if (!loadTexture(texture, "textures/grid.png")) return false;
+    const VkSamplerCreateInfo sampler = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .maxLod = 0.f,
+    };
+    if (vkCreateSampler(ctx.device, &sampler, nullptr, &texture_sampler) != VK_SUCCESS) return false;
+    const VkDescriptorImageInfo image = {
+        .sampler = texture_sampler, .imageView = texture.view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = model_set,
+        .dstBinding = 1, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image,
+    };
+    vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
+    return true;
+}
+
 bool initializeGraphicsPipeline() {
     auto& ctx = graphics::internal::context;
     const VkDescriptorSetLayoutBinding scene_bindings[] = {
@@ -246,12 +339,13 @@ bool initializeGraphicsPipeline() {
         .pBindings = scene_bindings,
     };
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &scene_layout) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayoutBinding model_binding = {
-        0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr,
+    const VkDescriptorSetLayoutBinding model_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
-    layout_info.pBindings = &model_binding;
-    layout_info.bindingCount = 1;
+    layout_info.pBindings = model_bindings;
+    layout_info.bindingCount = 2;
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &model_layout) != VK_SUCCESS) return false;
     const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
     const VkPipelineLayoutCreateInfo pipeline_layout_info = {
@@ -322,8 +416,8 @@ bool initializeGraphicsPipeline() {
 		{
 			.location = 1,
 			.binding = 0,
-			.format = VK_FORMAT_R32G32B32_SFLOAT,
-			.offset = offsetof(Vertex, color),
+			.format = VK_FORMAT_R32G32_SFLOAT,
+			.offset = offsetof(Vertex, uv),
 		},
 		{
 			.location = 2,
@@ -438,12 +532,13 @@ bool initializeObjects() {
     const VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 2,
-        .poolSizeCount = 3,
+        .poolSizeCount = 4,
         .pPoolSizes = sizes,
     };
     if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) return false;
@@ -478,10 +573,9 @@ void editModel(ModelControls& model) {
     ImGui::DragFloat3("Position", model.position, 0.05f);
     ImGui::DragFloat3("Rotation (deg)", model.rotation, 1.f);
     ImGui::DragFloat3("Scale", model.scale, 0.02f, 0.05f, 5.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::ColorEdit3("Albedo", model.albedo);
+    ImGui::ColorEdit3("Texture tint", model.albedo);
     ImGui::ColorEdit3("Specular color", model.specular);
     ImGui::SliderFloat("Shininess", &model.shininess, 1.f, 256.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::Checkbox("Procedural vertex colors (Lab 1)", &model.vertex_colors);
 }
 
 Vec3 trajectory(double time, float radius, float phase) {
@@ -527,7 +621,7 @@ void updateSceneBuffers(float aspect) {
             matMultiply(matRotateX(m.rotation[0]), matMultiply(matRotateZ(m.rotation[2]),
             matScale(m.scale[0], m.scale[1], m.scale[2])))));
         const ModelUniform data = {model,
-            {m.albedo[0], m.albedo[1], m.albedo[2], m.vertex_colors ? 1.f : 0.f},
+            {m.albedo[0], m.albedo[1], m.albedo[2], 0.f},
             {m.specular[0], m.specular[1], m.specular[2], m.shininess}};
         upload(model_buffer, &data, sizeof(data), i * model_stride);
     }
@@ -536,7 +630,7 @@ void updateSceneBuffers(float aspect) {
 } // namespace
 
 bool initialize() {
-    if (!initializeGraphicsPipeline() || !initializeObjects()) {
+    if (!initializeGraphicsPipeline() || !initializeObjects() || !initializeTexture()) {
         shutdown();
         return false;
     }
@@ -551,6 +645,9 @@ void shutdown() {
     vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, scene_layout, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, model_layout, nullptr);
+    vkDestroySampler(ctx.device, texture_sampler, nullptr);
+    vkDestroyImageView(ctx.device, texture.view, nullptr);
+    if (texture.image) vmaDestroyImage(ctx.allocator, texture.image, texture.allocation);
     destroyBuffer(model_buffer);
     destroyBuffer(geometry.vertices);
     destroyBuffer(geometry.indices);
@@ -565,7 +662,7 @@ void update(double time) {
     if (animation_enabled) animation_time += delta*animation_speed;
     ImGui::SetNextWindowSize(ImVec2(370.f, 650.f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Lab 2: Camera and Lighting");
+    ImGui::Begin("Lab 3: Texture Mapping");
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.48f);
     if (resource_error) ImGui::TextWrapped("%s", resource_error);
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -165,7 +165,8 @@ inline Vec3 normalized(Vec3 v) {
     return length > 0.f ? Vec3{v.x/length, v.y/length, v.z/length} : Vec3{};
 }
 
-struct Vertex { Vec3 position, color, normal; };
+struct Vec2 { float x, y; };
+struct Vertex { Vec3 position, normal; Vec2 uv; };
 
 inline constexpr Vec3 kTruncatedTetrahedronPositions[12] = {
 	{ 3.f, 1.f, 1.f },   // 0  P(A,B)
@@ -206,12 +207,28 @@ inline Mesh makeTruncatedTetrahedron() {
             normal = {-normal.x, -normal.y, -normal.z};
             std::reverse(face.begin(), face.end());
         }
+        // A face-local orthonormal basis keeps all triangles of each polygon continuous.
+        const Vec3 origin = kTruncatedTetrahedronPositions[face[0]];
+        const Vec3 tangent = normalized(subtract(kTruncatedTetrahedronPositions[face[1]], origin));
+        const Vec3 bitangent = cross(normal, tangent);
+        float min_u = 0.f, max_u = 0.f, min_v = 0.f, max_v = 0.f;
+        for (uint16_t index : face) {
+            const Vec3 delta = subtract(kTruncatedTetrahedronPositions[index], origin);
+            const float u = dot(delta, tangent), v = dot(delta, bitangent);
+            min_u = std::min(min_u, u); max_u = std::max(max_u, u);
+            min_v = std::min(min_v, v); max_v = std::max(max_v, v);
+        }
+        // Use the same scale on both axes to preserve texel aspect ratio.
+        const float extent = std::max(max_u - min_u, max_v - min_v);
         const uint16_t base = static_cast<uint16_t>(mesh.vertices.size());
         for (uint16_t index : face) {
             const Vec3 p = kTruncatedTetrahedronPositions[index];
-            mesh.vertices.push_back({p, {0.5f+p.x/6.f, 0.5f+p.y/6.f, 0.5f+p.z/6.f}, normal});
+            const Vec3 delta = subtract(p, origin);
+            const Vec2 uv = {0.5f + (dot(delta, tangent) - (min_u + max_u)*0.5f)/extent,
+                             0.5f - (dot(delta, bitangent) - (min_v + max_v)*0.5f)/extent};
+            mesh.vertices.push_back({p, normal, uv});
         }
-        for (uint16_t i = 1; i+1 < face.size(); ++i) {
+        for (uint16_t i = 1; size_t(i)+1 < face.size(); ++i) {
             mesh.indices.insert(mesh.indices.end(), {base, uint16_t(base+i), uint16_t(base+i+1)});
         }
     }
@@ -231,7 +248,7 @@ struct alignas(16) SceneUniform {
 };
 struct alignas(16) ModelUniform {
     Mat4 model;
-    Float4 albedo; // w = use procedural vertex color
+    Float4 albedo; // rgb = texture tint, w reserved
     Float4 specular; // w = shininess
 };
 struct alignas(16) PointLight {
