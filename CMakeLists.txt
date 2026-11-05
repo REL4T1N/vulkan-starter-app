@@ -48,6 +48,12 @@ FetchContent_Declare(
 	GIT_TAG v1.92.9
 )
 
+FetchContent_Declare(
+    lodepng
+    GIT_REPOSITORY https://github.com/lvandeve/lodepng.git
+    GIT_TAG 7b2893e35891c0c85bee5595caafaf3c2044b409
+)
+
 find_package(Vulkan REQUIRED)
 
 set(GLFW_LIBRARY_TYPE STATIC)
@@ -60,7 +66,11 @@ FetchContent_MakeAvailable(
 	vk-bootstrap
 	VulkanMemoryAllocator
 	imgui
+    lodepng
 )
+
+target_sources(${PROJECT_NAME} PRIVATE ${lodepng_SOURCE_DIR}/lodepng.cpp)
+target_include_directories(${PROJECT_NAME} PRIVATE ${lodepng_SOURCE_DIR})
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
 	glfw

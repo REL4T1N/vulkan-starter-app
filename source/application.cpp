@@ -3,8 +3,10 @@
 
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <imgui.h>
+#include <lodepng.h>
 
 namespace application {
 namespace {
@@ -16,11 +18,26 @@ struct Buffer {
     void* mapped = nullptr;
     VkDeviceSize size = 0;
 };
-struct ObjectResources {
-    Buffer vertices, indices, uniform;
-    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+struct MeshResources {
+    Buffer vertices, indices;
     uint32_t index_count = 0;
 };
+struct Texture {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+};
+struct TextureSource { const char* name; const char* path; };
+constexpr TextureSource texture_sources[] = {
+    {"UV grid", "textures/grid.png"},
+    {"Terracotta tiles", "textures/tiles.png"},
+    {"Blue waves", "textures/waves.png"},
+};
+constexpr uint32_t texture_count = static_cast<uint32_t>(std::size(texture_sources));
+Texture textures[texture_count];
+VkSampler texture_sampler = VK_NULL_HANDLE;
+
 struct ModelControls {
     float position[3];
     float rotation[3];
@@ -28,7 +45,13 @@ struct ModelControls {
     float albedo[3];
     float specular[3] = {0.8f, 0.8f, 0.8f};
     float shininess = 32.f;
-    bool vertex_colors = false;
+    int texture_index = 0;
+    bool sampling_effect = false;
+    bool sampling_paused = false;
+    float sampling_speed = 1.f;
+    float sampling_blend = 0.5f;
+    float sampling_scale = 2.f;
+    double sampling_time = 0.0;
 };
 struct SpotControls {
     PointLight light = {{0.f, 5.f, 5.f, 0.f}, {1.f, 0.85f, 0.6f, 35.f}};
@@ -43,13 +66,15 @@ VkDescriptorSetLayout model_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 VkDescriptorSet scene_set = VK_NULL_HANDLE;
 Buffer scene_buffer, point_buffer, spot_buffer;
-ObjectResources objects[2];
+Buffer model_buffer;
+VkDeviceSize model_stride = 0;
+MeshResources geometry;
 VkDeviceSize max_storage_range = 0;
 const char* resource_error = nullptr;
 
 ModelControls models[2] = {
-    {{-2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.65f, 0.65f, 0.65f}, {0.25f, 0.55f, 0.85f}},
-    {{ 2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}, {0.85f, 0.4f, 0.15f}},
+    {{-2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.65f, 0.65f, 0.65f}, {1.f, 1.f, 1.f}},
+    {{ 2.f, 0.f, 0.f}, {0.f, 0.f, 0.f}, {0.5f, 0.5f, 0.5f}, {1.f, 1.f, 1.f}},
 };
 float camera_position[3] = {0.f, 4.f, 13.f};
 float camera_angles[3] = {-17.f, 0.f, 0.f}; // pitch, yaw, roll in degrees
@@ -89,7 +114,7 @@ void destroyBuffer(Buffer& buffer) {
     buffer = {};
 }
 
-bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage) {
+bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage, bool device_local = false) {
     const VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
@@ -97,8 +122,10 @@ bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage) {
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     const VmaAllocationCreateInfo allocation = {
-        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = device_local ? VmaAllocationCreateFlags(0) :
+            VmaAllocationCreateFlags(VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT),
+        .usage = device_local ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .requiredFlags = device_local ? VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) : VkMemoryPropertyFlags(0),
     };
     VmaAllocationInfo mapped{};
     if (vmaCreateBuffer(graphics::internal::context.allocator, &info, &allocation,
@@ -112,17 +139,18 @@ bool createBuffer(Buffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage) {
     return true;
 }
 
-void upload(const Buffer& buffer, const void* data, size_t size) {
+void upload(const Buffer& buffer, const void* data, size_t size, VkDeviceSize offset = 0) {
     if (size == 0) return;
-    std::memcpy(buffer.mapped, data, size);
-    if (vmaFlushAllocation(graphics::internal::context.allocator, buffer.allocation, 0, size) != VK_SUCCESS) {
+    std::memcpy(static_cast<char*>(buffer.mapped) + offset, data, size);
+    if (vmaFlushAllocation(graphics::internal::context.allocator, buffer.allocation, offset, size) != VK_SUCCESS) {
         resource_error = "Could not flush GPU buffer memory.";
         std::cerr << resource_error << '\n';
     }
 }
 
-void bindBuffer(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const Buffer& buffer) {
-    const VkDescriptorBufferInfo info = {.buffer = buffer.handle, .offset = 0, .range = buffer.size};
+void bindBuffer(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const Buffer& buffer, VkDeviceSize range = VK_WHOLE_SIZE) {
+    const VkDescriptorBufferInfo info = {.buffer = buffer.handle, .offset = 0,
+        .range = range == VK_WHOLE_SIZE ? buffer.size : range};
     const VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set,
@@ -150,14 +178,170 @@ bool ensureStorage(Buffer& buffer, size_t count, size_t stride, uint32_t binding
     return true;
 }
 
-bool createObjectResources(ObjectResources& object, const Mesh& mesh) {
-    object.index_count = static_cast<uint32_t>(mesh.indices.size());
-    if (!createBuffer(object.vertices, mesh.vertices.size()*sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
-        !createBuffer(object.indices, mesh.indices.size()*sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT) ||
-        !createBuffer(object.uniform, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
-    upload(object.vertices, mesh.vertices.data(), mesh.vertices.size()*sizeof(Vertex));
-    upload(object.indices, mesh.indices.data(), mesh.indices.size()*sizeof(uint16_t));
-    bindBuffer(object.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, object.uniform);
+// Initialization uploads use the graphics queue, avoiding queue-family ownership transfers.
+// The staging allocation stays alive until the fence signals completion.
+bool transferToGpu(const void* data, VkDeviceSize size,
+                   const std::function<void(VkCommandBuffer, VkBuffer)>& record) {
+    auto& ctx = graphics::internal::context;
+    Buffer staging;
+    if (!createBuffer(staging, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return false;
+    upload(staging, data, size);
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    const bool success = [&] {
+        if (resource_error) return false;
+        const VkCommandPoolCreateInfo pool_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = ctx.graphics_queue_index,
+        };
+        if (vkCreateCommandPool(ctx.device, &pool_info, nullptr, &pool) != VK_SUCCESS) return false;
+        const VkCommandBufferAllocateInfo allocate = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+        };
+        VkCommandBuffer cmd;
+        if (vkAllocateCommandBuffers(ctx.device, &allocate, &cmd) != VK_SUCCESS) return false;
+        const VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return false;
+        record(cmd, staging.handle);
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+        const VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(ctx.device, &fence_info, nullptr, &fence) != VK_SUCCESS) return false;
+        const VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd,
+        };
+        if (vkQueueSubmit(ctx.graphics_queue, 1, &submit, fence) != VK_SUCCESS) return false;
+        const VkResult result = vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) vkDeviceWaitIdle(ctx.device);
+        return result == VK_SUCCESS;
+    }();
+    vkDestroyFence(ctx.device, fence, nullptr);
+    vkDestroyCommandPool(ctx.device, pool, nullptr);
+    destroyBuffer(staging);
+    if (!success) {
+        resource_error = "Could not upload resource to GPU.";
+        std::cerr << resource_error << '\n';
+    }
+    return success;
+}
+
+bool createGeometryBuffer(Buffer& buffer, const void* data, VkDeviceSize size,
+                          VkBufferUsageFlags usage, VkAccessFlags access) {
+    if (!createBuffer(buffer, size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return false;
+    return transferToGpu(data, size, [&](VkCommandBuffer cmd, VkBuffer staging) {
+        const VkBufferCopy copy = {.size = size};
+        vkCmdCopyBuffer(cmd, staging, buffer.handle, 1, &copy);
+        const VkBufferMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = access,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer.handle, .offset = 0, .size = size,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+    });
+}
+
+bool createGeometry(const Mesh& mesh) {
+    geometry.index_count = static_cast<uint32_t>(mesh.indices.size());
+    return createGeometryBuffer(geometry.vertices, mesh.vertices.data(), mesh.vertices.size()*sizeof(Vertex),
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT) &&
+           createGeometryBuffer(geometry.indices, mesh.indices.data(), mesh.indices.size()*sizeof(uint16_t),
+                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_ACCESS_INDEX_READ_BIT);
+}
+
+bool loadTexture(Texture& texture, const char* path) {
+    auto& ctx = graphics::internal::context;
+    std::vector<unsigned char> pixels;
+    unsigned width = 0, height = 0;
+    const unsigned error = lodepng::decode(pixels, width, height, path);
+    if (error) {
+        std::cerr << "Cannot load texture " << path << ": " << lodepng_error_text(error) << '\n';
+        return false;
+    }
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(ctx.physical_device, &properties);
+    if (!width || !height || width > properties.limits.maxImageDimension2D ||
+        height > properties.limits.maxImageDimension2D) {
+        std::cerr << "Texture dimensions exceed GPU limits: " << path << '\n';
+        return false;
+    }
+    const VkImageCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_SRGB, .extent = {width, height, 1},
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo allocation = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    };
+    if (vmaCreateImage(ctx.allocator, &info, &allocation, &texture.image, &texture.allocation, nullptr) != VK_SUCCESS)
+        return false;
+    if (!transferToGpu(pixels.data(), pixels.size(), [&](VkCommandBuffer cmd, VkBuffer staging) {
+        VkImageMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = texture.image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+        const VkBufferImageCopy copy = {
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {width, height, 1},
+        };
+        vkCmdCopyBufferToImage(cmd, staging, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    })) return false;
+    const VkImageViewCreateInfo view = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = texture.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = info.format,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    return vkCreateImageView(ctx.device, &view, nullptr, &texture.view) == VK_SUCCESS;
+}
+
+bool initializeTextures() {
+    auto& ctx = graphics::internal::context;
+    const VkSamplerCreateInfo sampler = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .maxLod = 0.f,
+    };
+    if (vkCreateSampler(ctx.device, &sampler, nullptr, &texture_sampler) != VK_SUCCESS) return false;
+    for (uint32_t i = 0; i < texture_count; ++i) {
+        auto& texture = textures[i];
+        if (!loadTexture(texture, texture_sources[i].path)) return false;
+        const VkDescriptorImageInfo image = {
+            .sampler = texture_sampler, .imageView = texture.view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = texture.descriptor_set,
+            .dstBinding = 1, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image,
+        };
+        vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
+    }
+    models[1].texture_index = 1;
+    models[1].sampling_effect = true;
     return true;
 }
 
@@ -174,13 +358,23 @@ bool initializeGraphicsPipeline() {
         .pBindings = scene_bindings,
     };
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &scene_layout) != VK_SUCCESS) return false;
-    layout_info.bindingCount = 1;
+    const VkDescriptorSetLayoutBinding model_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+    };
+    layout_info.pBindings = model_bindings;
+    layout_info.bindingCount = 2;
     if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &model_layout) != VK_SUCCESS) return false;
     const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout};
+    const VkPushConstantRange sampling_range = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = sizeof(SamplingPushConstants),
+    };
     const VkPipelineLayoutCreateInfo pipeline_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 2,
         .pSetLayouts = layouts,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &sampling_range,
     };
     if (vkCreatePipelineLayout(ctx.device, &pipeline_layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) return false;
 	std::vector<uint32_t> vert_code;
@@ -245,8 +439,8 @@ bool initializeGraphicsPipeline() {
 		{
 			.location = 1,
 			.binding = 0,
-			.format = VK_FORMAT_R32G32B32_SFLOAT,
-			.offset = offsetof(Vertex, color),
+			.format = VK_FORMAT_R32G32_SFLOAT,
+			.offset = offsetof(Vertex, uv),
 		},
 		{
 			.location = 2,
@@ -356,37 +550,42 @@ bool initializeObjects() {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(ctx.physical_device, &properties);
     max_storage_range = properties.limits.maxStorageBufferRange;
+    const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+    model_stride = (sizeof(ModelUniform) + alignment - 1) / alignment * alignment;
     const VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, texture_count},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 3,
-        .poolSizeCount = 2,
+        .maxSets = 1 + texture_count,
+        .poolSizeCount = 4,
         .pPoolSizes = sizes,
     };
     if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayout layouts[] = {scene_layout, model_layout, model_layout};
+    VkDescriptorSetLayout layouts[1 + texture_count];
+    layouts[0] = scene_layout;
+    std::fill(std::begin(layouts) + 1, std::end(layouts), model_layout);
     const VkDescriptorSetAllocateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptor_pool,
-        .descriptorSetCount = 3,
+        .descriptorSetCount = 1 + texture_count,
         .pSetLayouts = layouts,
     };
-    VkDescriptorSet sets[3]{};
+    VkDescriptorSet sets[1 + texture_count]{};
     if (vkAllocateDescriptorSets(ctx.device, &info, sets) != VK_SUCCESS) return false;
     scene_set = sets[0];
-    objects[0].descriptor_set = sets[1];
-    objects[1].descriptor_set = sets[2];
+    for (uint32_t i = 0; i < texture_count; ++i) textures[i].descriptor_set = sets[i + 1];
     if (!createBuffer(scene_buffer, sizeof(SceneUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
     bindBuffer(scene_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_buffer);
     if (!ensureStorage(point_buffer, point_lights.size(), sizeof(PointLight), 1) ||
         !ensureStorage(spot_buffer, spot_lights.size(), sizeof(SpotLight), 2)) return false;
-    const Mesh mesh = makeTruncatedTetrahedron();
-    for (auto& object : objects) {
-        if (!createObjectResources(object, mesh)) return false;
-    }
+    if (!createGeometry(makeTruncatedTetrahedron())) return false;
+    if (!createBuffer(model_buffer, model_stride * std::size(models), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
+    for (auto& texture : textures)
+        bindBuffer(texture.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, model_buffer, sizeof(ModelUniform));
     return true;
 }
 
@@ -400,10 +599,25 @@ void editModel(ModelControls& model) {
     ImGui::DragFloat3("Position", model.position, 0.05f);
     ImGui::DragFloat3("Rotation (deg)", model.rotation, 1.f);
     ImGui::DragFloat3("Scale", model.scale, 0.02f, 0.05f, 5.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::ColorEdit3("Albedo", model.albedo);
+    if (ImGui::BeginCombo("Albedo texture", texture_sources[model.texture_index].name)) {
+        for (uint32_t i = 0; i < texture_count; ++i) {
+            const bool selected = model.texture_index == static_cast<int>(i);
+            if (ImGui::Selectable(texture_sources[i].name, selected)) model.texture_index = static_cast<int>(i);
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::Checkbox("Animated sampling", &model.sampling_effect);
+    if (model.sampling_effect) {
+        ImGui::Checkbox("Pause texture animation", &model.sampling_paused);
+        ImGui::SliderFloat("Texture speed", &model.sampling_speed, 0.f, 3.f);
+        ImGui::SliderFloat("Sample blend", &model.sampling_blend, 0.f, 1.f);
+        ImGui::SliderFloat("Second sample scale", &model.sampling_scale, 0.5f, 4.f);
+        if (ImGui::Button("Reset texture animation")) model.sampling_time = 0.0;
+    }
+    ImGui::ColorEdit3("Texture tint", model.albedo);
     ImGui::ColorEdit3("Specular color", model.specular);
     ImGui::SliderFloat("Shininess", &model.shininess, 1.f, 256.f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::Checkbox("Procedural vertex colors (Lab 1)", &model.vertex_colors);
 }
 
 Vec3 trajectory(double time, float radius, float phase) {
@@ -449,16 +663,16 @@ void updateSceneBuffers(float aspect) {
             matMultiply(matRotateX(m.rotation[0]), matMultiply(matRotateZ(m.rotation[2]),
             matScale(m.scale[0], m.scale[1], m.scale[2])))));
         const ModelUniform data = {model,
-            {m.albedo[0], m.albedo[1], m.albedo[2], m.vertex_colors ? 1.f : 0.f},
+            {m.albedo[0], m.albedo[1], m.albedo[2], 0.f},
             {m.specular[0], m.specular[1], m.specular[2], m.shininess}};
-        upload(objects[i].uniform, &data, sizeof(data));
+        upload(model_buffer, &data, sizeof(data), i * model_stride);
     }
 }
 
 } // namespace
 
 bool initialize() {
-    if (!initializeGraphicsPipeline() || !initializeObjects()) {
+    if (!initializeGraphicsPipeline() || !initializeObjects() || !initializeTextures()) {
         shutdown();
         return false;
     }
@@ -473,11 +687,15 @@ void shutdown() {
     vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, scene_layout, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, model_layout, nullptr);
-    for (auto& object : objects) {
-        destroyBuffer(object.vertices);
-        destroyBuffer(object.indices);
-        destroyBuffer(object.uniform);
+    vkDestroySampler(ctx.device, texture_sampler, nullptr);
+    for (auto& texture : textures) {
+        vkDestroyImageView(ctx.device, texture.view, nullptr);
+        if (texture.image) vmaDestroyImage(ctx.allocator, texture.image, texture.allocation);
+        texture = {};
     }
+    destroyBuffer(model_buffer);
+    destroyBuffer(geometry.vertices);
+    destroyBuffer(geometry.indices);
     destroyBuffer(scene_buffer);
     destroyBuffer(point_buffer);
     destroyBuffer(spot_buffer);
@@ -487,9 +705,12 @@ void update(double time) {
     const double delta = last_frame_time == 0.0 ? 0.0 : time-last_frame_time;
     last_frame_time = time;
     if (animation_enabled) animation_time += delta*animation_speed;
+    for (auto& model : models)
+        if (model.sampling_effect && !model.sampling_paused)
+            model.sampling_time += delta * model.sampling_speed;
     ImGui::SetNextWindowSize(ImVec2(370.f, 650.f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Lab 2: Camera and Lighting");
+    ImGui::Begin("Lab 3: Texture Mapping");
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.48f);
     if (resource_error) ImGui::TextWrapped("%s", resource_error);
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -622,16 +843,22 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		pipeline_layout, 0, 1, &scene_set, 0, nullptr);
-	for (const ObjectResources& object : objects) {
+	for (uint32_t i = 0; i < std::size(models); ++i) {
+        const uint32_t dynamic_offset = static_cast<uint32_t>(i * model_stride);
+        const auto& model = models[i];
+        const SamplingPushConstants sampling = {model.sampling_effect ? 1u : 0u,
+            static_cast<float>(model.sampling_time), model.sampling_blend, model.sampling_scale};
+        vkCmdPushConstants(fd.command_buffer, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(sampling), &sampling);
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-								pipeline_layout, 1, 1, &object.descriptor_set, 0, nullptr);
+								pipeline_layout, 1, 1, &textures[models[i].texture_index].descriptor_set, 1, &dynamic_offset);
 
 		const VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.vertices.handle, &offset);
-		vkCmdBindIndexBuffer(fd.command_buffer, object.indices.handle, 0,
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &geometry.vertices.handle, &offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, geometry.indices.handle, 0,
 							 VK_INDEX_TYPE_UINT16);
 
-		vkCmdDrawIndexed(fd.command_buffer, object.index_count, 1, 0, 0, 0);
+		vkCmdDrawIndexed(fd.command_buffer, geometry.index_count, 1, 0, 0, 0);
 	}
 
 	vkCmdEndRenderPass(fd.command_buffer);
