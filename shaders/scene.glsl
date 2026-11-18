@@ -1,6 +1,9 @@
 // These layouts match SceneUniform and ModelUniform in source/scene.hpp.
 layout(std140, set = 0, binding = 0) uniform SceneUniform {
     mat4 viewProjection;
+    mat4 sunViewProjection;
+    mat4 spotViewProjection;
+    vec4 shadowParameters;
     vec4 cameraPosition;
     vec4 cameraForward;
     vec4 ambient;
