@@ -6,6 +6,8 @@ layout(location = 0) in vec3 worldPosition;
 layout(location = 1) in vec3 worldNormal;
 layout(location = 2) in vec2 textureUV;
 layout(set = 1, binding = 1) uniform sampler2D albedoTexture;
+layout(set = 0, binding = 3) uniform sampler2DShadow sunShadow;
+layout(set = 0, binding = 4) uniform sampler2DShadow spotShadow;
 layout(location = 0) out vec4 outColor;
 
 layout(push_constant) uniform SamplingParameters {
@@ -54,13 +56,23 @@ vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo) {
     return radiance * (albedo * diffuse + material.specular.rgb * specular);
 }
 
+float shadowVisibility(sampler2DShadow map, mat4 lightVP) {
+    vec4 clip = lightVP * vec4(worldPosition, 1.0);
+    vec3 projected = clip.xyz / clip.w;
+    vec2 uv = projected.xy * 0.5 + 0.5;
+    if (clip.w <= 0.0 || projected.z <= 0.0 || projected.z >= 1.0 ||
+        any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+    return texture(map, vec3(uv, projected.z - scene.shadowParameters.x));
+}
+
 void main() {
     vec3 N = safeNormalize(worldNormal);
     vec3 V = scene.cameraPosition.w > 0.5
         ? -scene.cameraForward.xyz : safeNormalize(scene.cameraPosition.xyz - worldPosition);
     vec3 albedo = material.albedo.rgb * sampleAlbedo();
     vec3 color = scene.ambient.rgb * albedo;
-    color += blinnPhong(N, V, -scene.directionalDirection.xyz,
+    color += shadowVisibility(sunShadow, scene.sunViewProjection) *
+        blinnPhong(N, V, -scene.directionalDirection.xyz,
                        scene.directionalColor.rgb * scene.directionalColor.w, albedo);
     for (uint i = 0u; i < scene.lightCounts.x; ++i) {
         PointLight light = points.values[i];
@@ -78,7 +90,9 @@ void main() {
         // Equal angles describe a hard edge; smoothstep requires distinct edges.
         float cone = inner > outer ? smoothstep(outer, inner, cosAngle) : step(outer, cosAngle);
         float attenuation = cone / max(dot(delta, delta), 1e-4);
-        color += blinnPhong(N, V, L, light.color.rgb * light.color.w * attenuation, albedo);
+        float visibility = i == 0u && scene.shadowParameters.y > 0.5
+            ? shadowVisibility(spotShadow, scene.spotViewProjection) : 1.0;
+        color += visibility * blinnPhong(N, V, L, light.color.rgb * light.color.w * attenuation, albedo);
     }
     outColor = vec4(color, 1.0);
 }
