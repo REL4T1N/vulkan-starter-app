@@ -72,4 +72,3 @@ orthographic half-extent, depth bias, and the first spotlight's shadow. The **Sp
 section controls that spotlight's position and cone. Both tetrahedra and the floor cast
 and receive shadows. Vulkan 1.3 with dynamic rendering and a sampleable `D32_SFLOAT`
 depth format are required.
-
