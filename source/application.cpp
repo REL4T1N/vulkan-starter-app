@@ -464,7 +464,7 @@ void recordShadowPass(VkCommandBuffer cmd, uint32_t light_index) {
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     map.initialized = true;
 }
@@ -795,10 +795,11 @@ void updateSceneBuffers(float aspect) {
     scene.view_projection = view_projection;
     const Float4 sun_dir = lightDirection(directional_angles[0], directional_angles[1]);
     const Vec3 sun_eye = {-sun_dir.x * 20.f, -sun_dir.y * 20.f, -sun_dir.z * 20.f};
+    const Vec3 sun_up = std::abs(sun_dir.y) > 0.98f ? Vec3{0.f, 0.f, 1.f} : Vec3{0.f, 1.f, 0.f};
     scene.sun_view_projection = matMultiply(matVulkanClipCorrection(),
         matMultiply(matOrtho(-sun_shadow_extent, sun_shadow_extent, -sun_shadow_extent,
                              sun_shadow_extent, 1.f, 60.f),
-                    matLookAt(sun_eye, {0.f, 0.f, 0.f}, {0.f, 1.f, 0.f})));
+                    matLookAt(sun_eye, {0.f, 0.f, 0.f}, sun_up)));
     const auto& spot = spot_lights.empty() ? SpotControls{} : spot_lights.front();
     const Float4 spot_dir = lightDirection(spot.pitch, spot.yaw);
     const Vec3 eye = {spot.light.position.x, spot.light.position.y, spot.light.position.z};
