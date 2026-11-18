@@ -64,3 +64,11 @@ because relative paths are used.
 `CMakeLists.txt` has a build recipe for compiling shader files
 along with an application. Look for a comment in this file to see
 how to compile your shaders.
+
+## Lab 4: shadow mapping
+
+Run the app from the repository root. The **Shadow mapping** section controls the sun's
+orthographic half-extent, depth bias, and the first spotlight's shadow. The **Spot lights**
+section controls that spotlight's position and cone. Both tetrahedra and the floor cast
+and receive shadows. Vulkan 1.3 with dynamic rendering and a sampleable `D32_SFLOAT`
+depth format are required.

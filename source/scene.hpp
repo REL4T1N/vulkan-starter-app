@@ -235,6 +235,22 @@ inline Mesh makeTruncatedTetrahedron() {
     return mesh;
 }
 
+inline Mesh makeSceneMesh() {
+    Mesh mesh = makeTruncatedTetrahedron();
+    const uint16_t base = static_cast<uint16_t>(mesh.vertices.size());
+    // Large two-sided ground quad. Both passes use the same indexed mesh.
+    const Vec3 up{0.f, 1.f, 0.f};
+    mesh.vertices.insert(mesh.vertices.end(), {
+        {{-10.f, -2.2f, -10.f}, up, {0.f, 0.f}},
+        {{-10.f, -2.2f,  10.f}, up, {0.f, 5.f}},
+        {{ 10.f, -2.2f,  10.f}, up, {5.f, 5.f}},
+        {{ 10.f, -2.2f, -10.f}, up, {5.f, 0.f}},
+    });
+    mesh.indices.insert(mesh.indices.end(), {base, uint16_t(base+1), uint16_t(base+2),
+                                             base, uint16_t(base+2), uint16_t(base+3)});
+    return mesh;
+}
+
 // All GPU records use 16-byte fields; these offsets match std140/std430 in GLSL.
 struct SamplingPushConstants {
     uint32_t enabled;
@@ -247,6 +263,9 @@ static_assert(sizeof(SamplingPushConstants) == 16 && offsetof(SamplingPushConsta
 struct alignas(16) Float4 { float x, y, z, w; };
 struct alignas(16) SceneUniform {
     Mat4 view_projection;
+    Mat4 sun_view_projection;
+    Mat4 spot_view_projection;
+    Float4 shadow_parameters; // x = depth bias, y = spot shadow enabled
     Float4 camera_position; // w = 1 for orthographic projection
     Float4 camera_forward;
     Float4 ambient;
@@ -269,7 +288,7 @@ struct alignas(16) SpotLight {
     Float4 direction; // w = cos(inner half-angle)
     Float4 cone; // x = cos(outer half-angle)
 };
-static_assert(sizeof(SceneUniform) == 160 && offsetof(SceneUniform, light_counts) == 144);
+static_assert(sizeof(SceneUniform) == 304 && offsetof(SceneUniform, light_counts) == 288);
 static_assert(sizeof(ModelUniform) == 96 && offsetof(ModelUniform, albedo) == 64);
 static_assert(sizeof(PointLight) == 32 && offsetof(PointLight, color) == 16);
 static_assert(sizeof(SpotLight) == 64 && offsetof(SpotLight, direction) == 32);
