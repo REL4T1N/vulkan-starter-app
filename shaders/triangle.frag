@@ -58,9 +58,10 @@ vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo) {
 
 float shadowVisibility(sampler2DShadow map, mat4 lightVP) {
     vec4 clip = lightVP * vec4(worldPosition, 1.0);
+    if (clip.w <= 0.0) return 1.0;
     vec3 projected = clip.xyz / clip.w;
     vec2 uv = projected.xy * 0.5 + 0.5;
-    if (clip.w <= 0.0 || projected.z <= 0.0 || projected.z >= 1.0 ||
+    if (projected.z <= 0.0 || projected.z >= 1.0 ||
         any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
     return texture(map, vec3(uv, projected.z - scene.shadowParameters.x));
 }

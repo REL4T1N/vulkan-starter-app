@@ -364,14 +364,22 @@ bool initializeShadowMaps() {
     auto& ctx = graphics::internal::context;
     VkFormatProperties properties{};
     vkGetPhysicalDeviceFormatProperties(ctx.physical_device, VK_FORMAT_D32_SFLOAT, &properties);
+    VkPhysicalDeviceProperties device_properties{};
+    vkGetPhysicalDeviceProperties(ctx.physical_device, &device_properties);
+    if (shadow_size > device_properties.limits.maxImageDimension2D) {
+        std::cerr << "Shadow map exceeds the device's maximum 2D image size\n";
+        return false;
+    }
     const auto needed = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
     if ((properties.optimalTilingFeatures & needed) != needed) {
         std::cerr << "D32_SFLOAT depth sampling is unsupported\n";
         return false;
     }
+    const VkFilter shadow_filter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+        ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     const VkSamplerCreateInfo sampler = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .magFilter = shadow_filter, .minFilter = shadow_filter,
         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
         .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
